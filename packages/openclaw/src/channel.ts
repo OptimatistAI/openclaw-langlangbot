@@ -105,7 +105,7 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
   agentPrompt: {
     messageToolHints: () => [
       "LangLangBot delivery target is conversation:<uuid> from the active session key.",
-      "Operator chat sets OwnerAllowFrom from ODA-attested operator_surface_id; cron tool is usually available without commands.ownerAllowFrom.",
+      "Operator chat sets OwnerAllowFrom from ODA-attested owner_surface_id; cron tool is usually available without commands.ownerAllowFrom.",
       "For Operator reminders via cron: payload.kind agentTurn, sessionTarget isolated, delivery { mode: announce } only (never channel without to). See langlangbot-channel skill.",
       "For Operator context/model questions (app runtime bar), call langlangbot_operator_runtime_status instead of session_status.",
     ],

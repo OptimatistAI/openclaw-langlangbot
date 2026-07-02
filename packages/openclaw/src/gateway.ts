@@ -10,9 +10,9 @@ import {
 } from "./config.js";
 import {
   openClawOwnerAllowFrom,
-  resolveOperatorFrom,
-  resolveVerifiedOperatorSurface,
-} from "./operator-surface.js";
+  resolveOwnerFrom,
+  resolveVerifiedOwnerSurface,
+} from "./owner-surface.js";
 import { getLanglangbotRuntime } from "./runtime.js";
 import {
   ensureLanglangbotSidecar,
@@ -29,7 +29,7 @@ type InboundHandle = {
   conversationId: string;
   messageId: string;
   text: string;
-  operatorSurfaceId?: string;
+  ownerSurfaceId?: string;
 };
 
 type AgentDispatchRuntime = {
@@ -92,13 +92,14 @@ export async function startLanglangbotGateway(
   });
 
   const unsubscribe = sidecar.subscribeInbound(
+    { accountId: account.accountId, agentSurfaceId: account.surfaceId },
     (evt) => {
       void handleInbound(
         {
           conversationId: evt.conversationId,
           messageId: evt.messageId,
           text: evt.text,
-          operatorSurfaceId: evt.operatorSurfaceId,
+          ownerSurfaceId: evt.ownerSurfaceId,
         },
         ctx,
         sidecar,
@@ -172,13 +173,11 @@ async function handleInbound(
   const account = ctx.account;
   const cfg = ctx.cfg;
   const to = conversationTarget(inbound.conversationId);
-  const verifiedSurfaceId = resolveVerifiedOperatorSurface({
-    operatorSurfaceId: inbound.operatorSurfaceId,
-    configuredSurfaceId: account.surfaceId,
+  const verifiedSurfaceId = resolveVerifiedOwnerSurface({
+    ownerSurfaceId: inbound.ownerSurfaceId,
   });
-  const from = resolveOperatorFrom({
-    operatorSurfaceId: inbound.operatorSurfaceId,
-    configuredSurfaceId: account.surfaceId,
+  const from = resolveOwnerFrom({
+    ownerSurfaceId: inbound.ownerSurfaceId,
     conversationId: inbound.conversationId,
   });
   const ownerAllowFrom = verifiedSurfaceId

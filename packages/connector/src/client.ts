@@ -154,8 +154,13 @@ export type InboundMessage = {
   messageId: string;
   text: string;
   receivedAt: string;
-  /** Base64 operator surface id attested by LangLangBot after ODA session.open. */
-  operatorSurfaceId?: string;
+  /** Base64 owner surface id attested by LangLangBot after ODA session.open. */
+  ownerSurfaceId?: string;
+};
+
+export type InboundSubscriptionParams = {
+  accountId?: string;
+  agentSurfaceId?: string;
 };
 
 export type HealthStatus = {
@@ -356,12 +361,42 @@ export class LanglangbotSidecar {
   subscribeInbound(
     onMessage: (evt: InboundMessage) => void,
     onError?: (err: Error) => void,
+  ): Unsubscribe;
+  subscribeInbound(
+    params: InboundSubscriptionParams,
+    onMessage: (evt: InboundMessage) => void,
+    onError?: (err: Error) => void,
+  ): Unsubscribe;
+  subscribeInbound(
+    paramsOrOnMessage:
+      | InboundSubscriptionParams
+      | ((evt: InboundMessage) => void),
+    onMessageOrError?: ((evt: InboundMessage) => void) | ((err: Error) => void),
+    onError?: (err: Error) => void,
   ): Unsubscribe {
+    const params =
+      typeof paramsOrOnMessage === "function" ? undefined : paramsOrOnMessage;
+    const onMessage =
+      typeof paramsOrOnMessage === "function"
+        ? paramsOrOnMessage
+        : (onMessageOrError as (evt: InboundMessage) => void);
+    const errorHandler =
+      typeof paramsOrOnMessage === "function"
+        ? (onMessageOrError as ((err: Error) => void) | undefined)
+        : onError;
+    const query = new URLSearchParams();
+    if (params?.accountId) {
+      query.set("account_id", params.accountId);
+    }
+    if (params?.agentSurfaceId) {
+      query.set("agent_surface_id", params.agentSurfaceId);
+    }
+    const suffix = query.size > 0 ? `?${query}` : "";
     return startReconnectingSse({
       errorLabel: "inbound SSE failed",
-      onError,
+      onError: errorHandler,
       connect: (signal) =>
-        this.fetchImpl(`${this.baseUrl}/v1/inbound/events`, {
+        this.fetchImpl(`${this.baseUrl}/v1/inbound/events${suffix}`, {
           headers: this.headers({ accept: "text/event-stream" }),
           signal,
         }),
@@ -372,7 +407,7 @@ export class LanglangbotSidecar {
             message_id?: string;
             text?: string;
             received_at?: string;
-            operator_surface_id?: string;
+            owner_surface_id?: string;
           };
           if (
             !parsed.conversation_id ||
@@ -386,7 +421,7 @@ export class LanglangbotSidecar {
             messageId: parsed.message_id,
             text: parsed.text,
             receivedAt: parsed.received_at ?? new Date().toISOString(),
-            operatorSurfaceId: parsed.operator_surface_id?.trim() || undefined,
+            ownerSurfaceId: parsed.owner_surface_id?.trim() || undefined,
           });
         } catch (err) {
           if (err instanceof SyntaxError) {

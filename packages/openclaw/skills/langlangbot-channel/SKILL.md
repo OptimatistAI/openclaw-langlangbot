@@ -74,13 +74,13 @@ LangLangBot supports two scheduling paths. Pick whichever matches the agent's av
 
 OpenClaw registers a built-in **`cron` tool** (included in `tools.profile: "coding"`). It is **owner-only**: non-owner chat senders do not receive it in the tool list.
 
-When the Operator opens a conversation via ODA (`session.open`), LangLangBot records the verified operator surface on that conversation. Each inbound user message includes `operator_surface_id` on the plugin SSE; the LangLangBot OpenClaw plugin sets **`OwnerAllowFrom`** for that turn from the attested surface. You usually **do not** need `commands.ownerAllowFrom` in `openclaw.json` for Operator chat.
+When the Operator opens a conversation via ODA (`session.open`), LangLangBot records the verified owner surface on that conversation. Each inbound user message includes `owner_surface_id` on the plugin SSE; the LangLangBot OpenClaw plugin sets **`OwnerAllowFrom`** for that turn from the attested surface. You usually **do not** need `commands.ownerAllowFrom` in `openclaw.json` for Operator chat.
 
 Your Operator sender id is the inbound `From` value, typically:
 
-`operator:<operator-surface-id>`
+`owner:<owner-surface-id>`
 
-Example from an active session: `operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=`
+Example from an active session: `owner:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=`
 
 **Fallback** — pin a human operator manually when the sidecar cannot attest a surface (dev without ODA, or legacy config):
 
@@ -88,7 +88,7 @@ Example from an active session: `operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5OD
 {
   commands: {
     ownerAllowFrom: [
-      "langlangbot:operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=",
+      "langlangbot:owner:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=",
     ],
   },
 }
@@ -97,7 +97,7 @@ Example from an active session: `operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5OD
 Or:
 
 ```bash
-openclaw config set commands.ownerAllowFrom '["langlangbot:operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM="]'
+openclaw config set commands.ownerAllowFrom '["langlangbot:owner:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM="]'
 ```
 
 Restart the gateway after changing static owner config. Verify with `openclaw doctor` (should no longer warn about missing command owner).
