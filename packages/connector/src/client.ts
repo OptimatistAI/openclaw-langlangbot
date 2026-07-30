@@ -154,8 +154,15 @@ export type InboundMessage = {
   messageId: string;
   text: string;
   receivedAt: string;
-  /** Base64 operator surface id attested by LangLangBot after ODA session.open. */
-  operatorSurfaceId?: string;
+  /** SSE `id:` from `/v1/inbound/events`; pass to `ackInbound` after successful dispatch. */
+  seq?: string;
+  /** Base64 owner surface id attested by LangLangBot after ODA session.open. */
+  ownerSurfaceId?: string;
+};
+
+export type InboundSubscriptionParams = {
+  accountId?: string;
+  agentSurfaceId?: string;
 };
 
 export type HealthStatus = {
@@ -239,25 +246,49 @@ function parseApprovalPluginEvent(raw: unknown): ApprovalPluginEvent | null {
   return null;
 }
 
+function inboundQuerySuffix(params?: {
+  accountId?: string;
+  agentSurfaceId?: string;
+}): string {
+  const query = new URLSearchParams();
+  if (params?.accountId) {
+    query.set("account_id", params.accountId);
+  }
+  if (params?.agentSurfaceId) {
+    query.set("agent_surface_id", params.agentSurfaceId);
+  }
+  return query.size > 0 ? `?${query}` : "";
+}
+
+function accountQuerySuffix(accountId?: string): string {
+  return inboundQuerySuffix(accountId ? { accountId } : undefined);
+}
+
 function startReconnectingSse(params: {
-  connect: (signal: AbortSignal) => Promise<Response>;
-  onData: (data: string) => void;
+  connect: (signal: AbortSignal, lastEventId?: string) => Promise<Response>;
+  onData: (data: string, eventId?: string) => void;
   onError?: (err: Error) => void;
   errorLabel: string;
 }): Unsubscribe {
   const controller = new AbortController();
   void (async () => {
     let attempt = 0;
+    let lastEventId: string | undefined;
     while (!controller.signal.aborted) {
       try {
-        const response = await params.connect(controller.signal);
+        const response = await params.connect(controller.signal, lastEventId);
         if (!response.ok) {
           throw new Error(`${params.errorLabel}: ${response.status}`);
         }
         attempt = 0;
         await consumeSse(
           response,
-          (_eventName, data) => params.onData(data),
+          (_eventName, data, eventId) => {
+            if (eventId) {
+              lastEventId = eventId;
+            }
+            params.onData(data, eventId);
+          },
           controller.signal,
         );
       } catch (err) {
@@ -277,7 +308,7 @@ function startReconnectingSse(params: {
 
 async function consumeSse(
   response: Response,
-  onEvent: (eventName: string, data: string) => void,
+  onEvent: (eventName: string, data: string, eventId?: string) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   if (!response.body) {
@@ -287,16 +318,19 @@ async function consumeSse(
   const decoder = new TextDecoder();
   let buffer = "";
   let eventName = "message";
+  let eventId: string | undefined;
   let dataLines: string[] = [];
 
   const flush = () => {
     if (dataLines.length === 0) {
+      eventId = undefined;
       return;
     }
     const payload =
       dataLines.length === 1 ? dataLines[0] : dataLines.join("\n");
-    onEvent(eventName, payload);
+    onEvent(eventName, payload, eventId);
     eventName = "message";
+    eventId = undefined;
     dataLines = [];
   };
 
@@ -315,6 +349,8 @@ async function consumeSse(
         flush();
       } else if (line.startsWith("event:")) {
         eventName = line.slice(6).trim();
+      } else if (line.startsWith("id:")) {
+        eventId = line.slice(3).trim();
       } else if (line.startsWith("data:")) {
         dataLines.push(line.slice(5).trimStart());
       }
@@ -356,23 +392,49 @@ export class LanglangbotSidecar {
   subscribeInbound(
     onMessage: (evt: InboundMessage) => void,
     onError?: (err: Error) => void,
+  ): Unsubscribe;
+  subscribeInbound(
+    params: InboundSubscriptionParams,
+    onMessage: (evt: InboundMessage) => void,
+    onError?: (err: Error) => void,
+  ): Unsubscribe;
+  subscribeInbound(
+    paramsOrOnMessage:
+      | InboundSubscriptionParams
+      | ((evt: InboundMessage) => void),
+    onMessageOrError?: ((evt: InboundMessage) => void) | ((err: Error) => void),
+    onError?: (err: Error) => void,
   ): Unsubscribe {
+    const params =
+      typeof paramsOrOnMessage === "function" ? undefined : paramsOrOnMessage;
+    const onMessage =
+      typeof paramsOrOnMessage === "function"
+        ? paramsOrOnMessage
+        : (onMessageOrError as (evt: InboundMessage) => void);
+    const errorHandler =
+      typeof paramsOrOnMessage === "function"
+        ? (onMessageOrError as ((err: Error) => void) | undefined)
+        : onError;
+    const suffix = inboundQuerySuffix(params);
     return startReconnectingSse({
       errorLabel: "inbound SSE failed",
-      onError,
-      connect: (signal) =>
-        this.fetchImpl(`${this.baseUrl}/v1/inbound/events`, {
-          headers: this.headers({ accept: "text/event-stream" }),
+      onError: errorHandler,
+      connect: (signal, lastEventId) =>
+        this.fetchImpl(`${this.baseUrl}/v1/inbound/events${suffix}`, {
+          headers: this.headers({
+            accept: "text/event-stream",
+            ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
+          }),
           signal,
         }),
-      onData: (data) => {
+      onData: (data, eventId) => {
         try {
           const parsed = JSON.parse(data) as {
             conversation_id?: string;
             message_id?: string;
             text?: string;
             received_at?: string;
-            operator_surface_id?: string;
+            owner_surface_id?: string;
           };
           if (
             !parsed.conversation_id ||
@@ -386,7 +448,8 @@ export class LanglangbotSidecar {
             messageId: parsed.message_id,
             text: parsed.text,
             receivedAt: parsed.received_at ?? new Date().toISOString(),
-            operatorSurfaceId: parsed.operator_surface_id?.trim() || undefined,
+            seq: eventId?.trim() || undefined,
+            ownerSurfaceId: parsed.owner_surface_id?.trim() || undefined,
           });
         } catch (err) {
           if (err instanceof SyntaxError) {
@@ -396,6 +459,21 @@ export class LanglangbotSidecar {
         }
       },
     });
+  }
+
+  async ackInbound(input: {
+    cursor: string;
+    accountId?: string;
+  }): Promise<void> {
+    const suffix = accountQuerySuffix(input.accountId);
+    const response = await this.fetchImpl(`${this.baseUrl}/v1/inbound/ack${suffix}`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ cursor: input.cursor }),
+    });
+    if (!response.ok) {
+      throw new Error(`ackInbound failed: ${response.status}`);
+    }
   }
 
   subscribeApprovalPluginEvents(
@@ -564,11 +642,7 @@ export class LanglangbotSidecar {
     onEvent: (evt: ManagementRequestEvent) => void,
     onError?: (err: Error) => void,
   ): Unsubscribe {
-    const query = new URLSearchParams();
-    if (params?.accountId) {
-      query.set("account_id", params.accountId);
-    }
-    const suffix = query.size > 0 ? `?${query}` : "";
+    const suffix = accountQuerySuffix(params?.accountId);
     return startReconnectingSse({
       errorLabel: "management SSE failed",
       onError,

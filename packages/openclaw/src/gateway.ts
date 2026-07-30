@@ -10,9 +10,9 @@ import {
 } from "./config.js";
 import {
   openClawOwnerAllowFrom,
-  resolveOperatorFrom,
-  resolveVerifiedOperatorSurface,
-} from "./operator-surface.js";
+  resolveOwnerFrom,
+  resolveVerifiedOwnerSurface,
+} from "./owner-surface.js";
 import { getLanglangbotRuntime } from "./runtime.js";
 import {
   ensureLanglangbotSidecar,
@@ -29,7 +29,9 @@ type InboundHandle = {
   conversationId: string;
   messageId: string;
   text: string;
-  operatorSurfaceId?: string;
+  /** SSE event id from sidecar; ack after successful dispatch. */
+  seq?: string;
+  ownerSurfaceId?: string;
 };
 
 type AgentDispatchRuntime = {
@@ -92,13 +94,15 @@ export async function startLanglangbotGateway(
   });
 
   const unsubscribe = sidecar.subscribeInbound(
+    { accountId: account.accountId, agentSurfaceId: account.surfaceId },
     (evt) => {
       void handleInbound(
         {
           conversationId: evt.conversationId,
           messageId: evt.messageId,
           text: evt.text,
-          operatorSurfaceId: evt.operatorSurfaceId,
+          seq: evt.seq,
+          ownerSurfaceId: evt.ownerSurfaceId,
         },
         ctx,
         sidecar,
@@ -172,13 +176,11 @@ async function handleInbound(
   const account = ctx.account;
   const cfg = ctx.cfg;
   const to = conversationTarget(inbound.conversationId);
-  const verifiedSurfaceId = resolveVerifiedOperatorSurface({
-    operatorSurfaceId: inbound.operatorSurfaceId,
-    configuredSurfaceId: account.surfaceId,
+  const verifiedSurfaceId = resolveVerifiedOwnerSurface({
+    ownerSurfaceId: inbound.ownerSurfaceId,
   });
-  const from = resolveOperatorFrom({
-    operatorSurfaceId: inbound.operatorSurfaceId,
-    configuredSurfaceId: account.surfaceId,
+  const from = resolveOwnerFrom({
+    ownerSurfaceId: inbound.ownerSurfaceId,
     conversationId: inbound.conversationId,
   });
   const ownerAllowFrom = verifiedSurfaceId
@@ -300,6 +302,17 @@ async function handleInbound(
       },
     });
     await reportAgentRuntimeStatus(sidecar, ctx, readiness);
+    if (inbound.seq) {
+      try {
+        await sidecar.ackInbound({ cursor: inbound.seq, accountId: account.accountId });
+      } catch (err) {
+        ctx.log?.warn?.(
+          `[langlangbot:${account.accountId}] inbound ack failed (seq=${inbound.seq}): ${
+            formatError(err)
+          }`,
+        );
+      }
+    }
   } catch (err) {
     const message = formatError(err);
     await reportAgentRuntimeStatus(sidecar, ctx, {
