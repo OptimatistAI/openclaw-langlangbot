@@ -12,6 +12,7 @@ export {
   normalizeApprovalKind,
   type HealthStatus,
   type InboundMessage,
+  type InboundSubscriptionParams,
   type LanglangbotSidecarOptions,
   type AgentRuntimeStatusUpdate,
   type ManagementRequestEvent,

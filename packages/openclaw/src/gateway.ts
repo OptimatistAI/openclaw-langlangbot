@@ -10,9 +10,9 @@ import {
 } from "./config.js";
 import {
   openClawOwnerAllowFrom,
-  resolveOperatorFrom,
-  resolveVerifiedOperatorSurface,
-} from "./operator-surface.js";
+  resolveOwnerFrom,
+  resolveVerifiedOwnerSurface,
+} from "./owner-surface.js";
 import { getLanglangbotRuntime } from "./runtime.js";
 import {
   ensureLanglangbotSidecar,
@@ -29,8 +29,35 @@ type InboundHandle = {
   conversationId: string;
   messageId: string;
   text: string;
-  operatorSurfaceId?: string;
+  /** SSE event id from sidecar; ack after successful dispatch. */
+  seq?: string;
+  ownerSurfaceId?: string;
 };
+
+function chatTimingWall(): string {
+  const d = new Date();
+  const pad = (n: number, width = 2) => String(n).padStart(width, "0");
+  const offsetMin = -d.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${pad(d.getMilliseconds(), 3)}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+}
+
+function logChatTiming(
+  log: ChannelGatewayContext<LanglangbotAccount>["log"],
+  opts: {
+    phase: string;
+    conversationId: string;
+    messageId: string;
+    assistantMessageId?: string | null;
+    elapsedMs: number;
+  },
+): void {
+  const assistant = (opts.assistantMessageId ?? "-").toLowerCase();
+  log?.info?.(
+    `[chat-timing] phase=${opts.phase} layer=plugin conversation=${opts.conversationId.toLowerCase()} message=${opts.messageId.toLowerCase()} assistant_message=${assistant} elapsed_ms=${opts.elapsedMs} wall=${chatTimingWall()}`,
+  );
+}
 
 type AgentDispatchRuntime = {
   session: {
@@ -92,13 +119,15 @@ export async function startLanglangbotGateway(
   });
 
   const unsubscribe = sidecar.subscribeInbound(
+    { accountId: account.accountId, agentSurfaceId: account.surfaceId },
     (evt) => {
       void handleInbound(
         {
           conversationId: evt.conversationId,
           messageId: evt.messageId,
           text: evt.text,
-          operatorSurfaceId: evt.operatorSurfaceId,
+          seq: evt.seq,
+          ownerSurfaceId: evt.ownerSurfaceId,
         },
         ctx,
         sidecar,
@@ -158,6 +187,41 @@ async function handleInbound(
   ctx: ChannelGatewayContext<LanglangbotAccount>,
   sidecar: LanglangbotSidecar,
 ): Promise<void> {
+  const turnTiming = {
+    t0: performance.now(),
+    firstOutboundLogged: false,
+  };
+  const timingElapsedMs = () => Math.round(performance.now() - turnTiming.t0);
+  const markOutboundFirst = (assistantMessageId?: string | null) => {
+    if (turnTiming.firstOutboundLogged) {
+      return;
+    }
+    turnTiming.firstOutboundLogged = true;
+    logChatTiming(ctx.log, {
+      phase: "plugin_outbound_first",
+      conversationId: inbound.conversationId,
+      messageId: inbound.messageId,
+      assistantMessageId,
+      elapsedMs: timingElapsedMs(),
+    });
+  };
+  const markOutboundFinal = (assistantMessageId?: string | null) => {
+    logChatTiming(ctx.log, {
+      phase: "plugin_outbound_final",
+      conversationId: inbound.conversationId,
+      messageId: inbound.messageId,
+      assistantMessageId,
+      elapsedMs: timingElapsedMs(),
+    });
+  };
+
+  logChatTiming(ctx.log, {
+    phase: "plugin_inbound",
+    conversationId: inbound.conversationId,
+    messageId: inbound.messageId,
+    elapsedMs: 0,
+  });
+
   const readiness = runtimeReadiness(ctx);
   if (!readiness.ready) {
     await reportAgentRuntimeStatus(sidecar, ctx, readiness);
@@ -172,13 +236,11 @@ async function handleInbound(
   const account = ctx.account;
   const cfg = ctx.cfg;
   const to = conversationTarget(inbound.conversationId);
-  const verifiedSurfaceId = resolveVerifiedOperatorSurface({
-    operatorSurfaceId: inbound.operatorSurfaceId,
-    configuredSurfaceId: account.surfaceId,
+  const verifiedSurfaceId = resolveVerifiedOwnerSurface({
+    ownerSurfaceId: inbound.ownerSurfaceId,
   });
-  const from = resolveOperatorFrom({
-    operatorSurfaceId: inbound.operatorSurfaceId,
-    configuredSurfaceId: account.surfaceId,
+  const from = resolveOwnerFrom({
+    ownerSurfaceId: inbound.ownerSurfaceId,
     conversationId: inbound.conversationId,
   });
   const ownerAllowFrom = verifiedSurfaceId
@@ -209,6 +271,13 @@ async function handleInbound(
       ...(ownerAllowFrom ? { OwnerAllowFrom: ownerAllowFrom } : {}),
     });
     const streamState = { streamedText: "", sentFinal: false };
+
+    logChatTiming(ctx.log, {
+      phase: "plugin_dispatch",
+      conversationId: inbound.conversationId,
+      messageId: inbound.messageId,
+      elapsedMs: timingElapsedMs(),
+    });
 
     await runtime.turn.run({
       channel: "langlangbot",
@@ -254,6 +323,7 @@ async function handleInbound(
                     ctx.log?.debug?.(
                       `[langlangbot:${account.accountId}] outbound delta (${text.length} chars) → ${inbound.conversationId}`,
                     );
+                    markOutboundFirst(null);
                     await sidecar.sendDelta(inbound.conversationId, text);
                     return;
                   }
@@ -263,13 +333,16 @@ async function handleInbound(
                     ctx.log?.debug?.(
                       `[langlangbot:${account.accountId}] outbound delta (final, ${text.length} chars) → ${inbound.conversationId}`,
                     );
+                    markOutboundFirst(null);
                     await sidecar.sendDelta(inbound.conversationId, text);
                   }
                   ctx.log?.info?.(
                     `[langlangbot:${account.accountId}] outbound message (${text.length} chars) → ${inbound.conversationId}`,
                   );
-                  await sidecar.sendMessage(inbound.conversationId, text);
+                  const sent = await sidecar.sendMessage(inbound.conversationId, text);
                   streamState.sentFinal = true;
+                  markOutboundFirst(sent.message_id);
+                  markOutboundFinal(sent.message_id);
                 },
                 onIdle: async () => {
                   if (
@@ -280,11 +353,13 @@ async function handleInbound(
                     ctx.log?.info?.(
                       `[langlangbot:${account.accountId}] outbound message onIdle (${streamState.streamedText.length} chars) → ${inbound.conversationId}`,
                     );
-                    await sidecar.sendMessage(
+                    const sent = await sidecar.sendMessage(
                       inbound.conversationId,
                       streamState.streamedText,
                     );
                     streamState.sentFinal = true;
+                    markOutboundFirst(sent.message_id);
+                    markOutboundFinal(sent.message_id);
                   }
                 },
                 onError: (err: unknown, info: { kind?: string }) => {
@@ -300,6 +375,17 @@ async function handleInbound(
       },
     });
     await reportAgentRuntimeStatus(sidecar, ctx, readiness);
+    if (inbound.seq) {
+      try {
+        await sidecar.ackInbound({ cursor: inbound.seq, accountId: account.accountId });
+      } catch (err) {
+        ctx.log?.warn?.(
+          `[langlangbot:${account.accountId}] inbound ack failed (seq=${inbound.seq}): ${
+            formatError(err)
+          }`,
+        );
+      }
+    }
   } catch (err) {
     const message = formatError(err);
     await reportAgentRuntimeStatus(sidecar, ctx, {
