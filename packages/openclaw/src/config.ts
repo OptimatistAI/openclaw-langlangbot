@@ -1,6 +1,7 @@
 import { LanglangbotSidecar } from "@optimatist/langlangbot-connector";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
+import { resolveLanglangbotAgentId } from "./agent-id.js";
 import { DEFAULT_SIDECAR_URL } from "./defaults.js";
 
 export type LanglangbotAccount = {
@@ -19,6 +20,8 @@ export type LanglangbotAccount = {
   sidecarInsecureTls: boolean;
   pluginToken?: string;
   surfaceId?: string;
+  /** OpenClaw agent id for session keys and provider auth (defaults to gateway default agent). */
+  agentId: string;
   streaming: boolean;
 };
 
@@ -90,6 +93,7 @@ export function resolveLanglangbotAccount(
     sidecarInsecureTls,
     pluginToken,
     surfaceId,
+    agentId: resolveLanglangbotAgentId(cfg, { accountId: id }),
     streaming,
   };
 }
