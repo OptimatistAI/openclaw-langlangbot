@@ -74,13 +74,13 @@ LangLangBot supports two scheduling paths. Pick whichever matches the agent's av
 
 OpenClaw registers a built-in **`cron` tool** (included in `tools.profile: "coding"`). It is **owner-only**: non-owner chat senders do not receive it in the tool list.
 
-When the Operator opens a conversation via ODA (`session.open`), LangLangBot records the verified operator surface on that conversation. Each inbound user message includes `operator_surface_id` on the plugin SSE; the LangLangBot OpenClaw plugin sets **`OwnerAllowFrom`** for that turn from the attested surface. You usually **do not** need `commands.ownerAllowFrom` in `openclaw.json` for Operator chat.
+When the Operator opens a conversation via ODA (`session.open`), LangLangBot records the verified owner surface on that conversation. Each inbound user message includes `owner_surface_id` on the plugin SSE; the LangLangBot OpenClaw plugin sets **`OwnerAllowFrom`** for that turn from the attested surface. You usually **do not** need `commands.ownerAllowFrom` in `openclaw.json` for Operator chat.
 
 Your Operator sender id is the inbound `From` value, typically:
 
-`operator:<operator-surface-id>`
+`owner:<owner-surface-id>`
 
-Example from an active session: `operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=`
+Example from an active session: `owner:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=`
 
 **Fallback** — pin a human operator manually when the sidecar cannot attest a surface (dev without ODA, or legacy config):
 
@@ -88,7 +88,7 @@ Example from an active session: `operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5OD
 {
   commands: {
     ownerAllowFrom: [
-      "langlangbot:operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=",
+      "langlangbot:owner:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM=",
     ],
   },
 }
@@ -97,7 +97,7 @@ Example from an active session: `operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5OD
 Or:
 
 ```bash
-openclaw config set commands.ownerAllowFrom '["langlangbot:operator:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM="]'
+openclaw config set commands.ownerAllowFrom '["langlangbot:owner:PJJkkprTmv/lGeX8qq9AJQCmrs2lqBi1C3V5ODFIWqM="]'
 ```
 
 Restart the gateway after changing static owner config. Verify with `openclaw doctor` (should no longer warn about missing command owner).
@@ -180,6 +180,91 @@ openclaw cron add \
 - `--to conversation:<uuid>` is **required** for langlangbot announce delivery.
 - `--session-key` should match the active langlangbot session (same `<uuid>` as in `--to`).
 - One-shot schedules use `--at 2m` (not `+2m`).
+
+## Media attachments (files, images, audio, video)
+
+LangLangBot supports async attachment upload and download. Operator may send a message with **pending** attachments while large files upload in the background.
+
+### Inbound pending attachments
+
+When inbound context includes `[附件] ... status=pending|uploading|processing`:
+
+- Acknowledge the user's intent immediately.
+- Do **not** claim you have already analyzed the file contents.
+- For non-streamable files, or tasks that require the complete file, wait for `attachment_ready`, then analyze using the provided `path=` or `url=`.
+- For streamable files, follow the `attachment_available` guidance below before deciding whether early partial analysis is appropriate.
+
+Attachment status meanings:
+
+- `pending`: Operator declared an attachment and the message references its `upload_id`, but no readable bytes are available yet.
+- `uploading`: Sidecar is receiving bytes. Treat it as unreadable unless an `attachment_available` update provides `path=` and `bytes_available`.
+- `processing`: Upload body is complete, but sidecar is still validating content, hash, and final file state. Wait for `attachment_ready` unless you are only using an earlier `attachment_available` prefix.
+- `ready`: Full attachment is stable. Use the provided `path=` for local processing or `url=` when a download is needed.
+
+Example user message: “I'm uploading a video; after you receive it, identify the objects inside.” Reply that you'll analyze once upload completes.
+
+### Streamable inbound attachments
+
+Some inbound attachments can be read before the full upload finishes. LangLangBot sends `attachment_available` only for streamable media/text inputs and includes a local staging `path=`, `bytes_available`, total `size`, and `final=false`.
+
+Use this early path only when the user's request can be satisfied from a prefix of the file:
+
+- Good: “look at the first minute of this video”, “summarize the beginning of this log”, “start transcribing audio as it arrives”.
+- Not enough: whole-document extraction, spreadsheet/Office parsing, archive inspection, checksum-sensitive work, or anything that requires the complete file.
+
+When using a streamable partial file:
+
+1. Treat `path=` as a growing local file; read only the available prefix.
+2. State clearly that the result is based on partial data if you answer before `attachment_ready`.
+3. Keep watching for `attachment_ready` when the full file is needed or when you need to verify the final content.
+4. Do not assume ordinary MP4/MOV is parseable before completion; some containers keep metadata at the end. If parsing fails, wait for `attachment_ready`.
+
+### Outbound files back to Operator
+
+To send generated files (spreadsheet results, exports, images):
+
+1. Write or copy the file under `~/.openclaw/media/langlangbot/outbound/` (or export from workspace into that tree).
+2. Use an **absolute path** inside the media root only — arbitrary host paths are rejected.
+3. Large files may appear as **pending outbound attachments** first; Operator shows “assistant is sending file” until ready.
+
+Supported kinds: image, audio, video, file. Size limits follow manifest `features.attachments` (defaults: image 30MiB, audio 20MiB, video/file 100MiB). Override in `~/.langlangbot/env`:
+
+- `LANGLANGBOT_MEDIA_MAX_IMAGE_BYTES`
+- `LANGLANGBOT_MEDIA_MAX_AUDIO_BYTES`
+- `LANGLANGBOT_MEDIA_MAX_VIDEO_BYTES`
+- `LANGLANGBOT_MEDIA_MAX_FILE_BYTES`
+
+Restart the sidecar after changing env values.
+
+### Resumable upload (Operator / unstable networks)
+
+When `features.attachments.resumable_upload` is true:
+
+1. `POST /v1/attachments/uploads` declares total `size`.
+2. `GET /v1/attachments/uploads/{upload_id}` returns `bytes_received` for resume.
+3. Upload body with `PUT .../body` and `Content-Range: bytes {start}-{end}/{total}` per chunk.
+4. Partial chunks return `202` with `{ status: "uploading", bytes_received, size }`.
+5. Final chunk returns `200` with `{ status: "ready", attachment_id, ... }`.
+6. Full single-shot upload (no `Content-Range`) still works when `bytes_received` is 0.
+
+### Resumable download
+
+When `features.attachments.range_requests` is true:
+
+1. `GET /v1/attachments/{attachment_id}` without `Range` returns the full file (`200`) with `Accept-Ranges: bytes`.
+2. Resume with `Range: bytes={start}-{end}`; server returns `206 Partial Content` and `Content-Range: bytes {start}-{end}/{total}`.
+3. Open-ended ranges (`bytes={start}-`) and suffix ranges (`bytes=-{suffix}`) are supported.
+4. Invalid or unsatisfiable ranges return `416` with `Content-Range: bytes */{total}`.
+
+### Content validation
+
+When `features.attachments.content_sha256` / `content_sniff` are true:
+
+1. `POST /v1/attachments/uploads` may include optional `sha256` (64 hex chars). Sidecar verifies the digest after upload completes.
+2. Upload uses incremental SHA256 while chunks arrive; resume rebuilds the prefix hash from the partial file.
+3. Finalize runs lightweight magic-byte sniff for `image` / `audio` / `video` kinds and rejects declared MIME spoofing (`422 content_mismatch`).
+4. Outbound register accepts optional `sha256` and applies the same sniff after import.
+5. Download continues to expose stored digest via `ETag`.
 
 ## OpenClaw exec known issues
 
