@@ -95,7 +95,7 @@ export function registerLanglangbotTools(api: OpenClawPluginApi): void {
       if (!runtime) {
         return null;
       }
-      const { accountId } = runtime;
+      const { accountId, account } = runtime;
       return {
         name: "langlangbot_operator_runtime_status",
         label: "LangLang Operator runtime status",
@@ -113,7 +113,11 @@ export function registerLanglangbotTools(api: OpenClawPluginApi): void {
             });
           }
           try {
-            const status = await getAgentSessionStatus({ accountId, conversationId });
+            const status = await getAgentSessionStatus({
+              accountId,
+              conversationId,
+              agentId: account.agentId,
+            });
             return jsonResult(formatOperatorRuntimeStatusForAgent(status));
           } catch (err) {
             return jsonResult({

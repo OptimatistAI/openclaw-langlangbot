@@ -21,6 +21,10 @@ const sessionStoreCache = new Map<string, SessionStoreCacheEntry>();
 
 let openclawSessionStoreConfig: unknown;
 
+export function getOpenclawSessionStoreConfig(): unknown {
+  return openclawSessionStoreConfig;
+}
+
 export function setOpenclawSessionStoreConfig(store: unknown): void {
   openclawSessionStoreConfig = store;
 }
