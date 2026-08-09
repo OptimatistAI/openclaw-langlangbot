@@ -4,6 +4,16 @@ export type ApprovalAction = {
   style?: string;
 };
 
+/** Operator-visible agent turn phases (`agent_turn` SSE / outbound/turn). */
+export type AgentTurnPhase =
+  | "waiting_attachments"
+  | "working"
+  | "thinking"
+  | "tool"
+  | "streaming"
+  | "idle"
+  | "failed";
+
 /**
  * Wire/API approval kind — extensible string, not a closed union.
  *
@@ -153,10 +163,36 @@ export type InboundMessage = {
   conversationId: string;
   messageId: string;
   text: string;
+  parts: ContentPart[];
   receivedAt: string;
-  /** Base64 operator surface id attested by LangLangBot after ODA session.open. */
-  operatorSurfaceId?: string;
+  /** SSE `id:` from `/v1/inbound/events`; pass to `ackInbound` after successful dispatch. */
+  seq?: string;
+  /** Base64 owner surface id attested by LangLangBot after ODA session.open. */
+  ownerSurfaceId?: string;
 };
+
+export type InboundSubscriptionParams = {
+  accountId?: string;
+  agentSurfaceId?: string;
+};
+
+export type InboundHandler = {
+  onMessage?: (evt: InboundMessage) => void;
+  onAttachmentAvailable?: (evt: InboundAttachmentAvailable) => void;
+  onAttachmentReady?: (evt: InboundAttachmentReady) => void;
+  onAttachmentFailed?: (evt: InboundAttachmentFailed) => void;
+};
+
+function isInboundHandler(value: unknown): value is InboundHandler {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    ("onMessage" in value ||
+      "onAttachmentAvailable" in value ||
+      "onAttachmentReady" in value ||
+      "onAttachmentFailed" in value)
+  );
+}
 
 export type HealthStatus = {
   status: string;
@@ -165,6 +201,16 @@ export type HealthStatus = {
 
 export type Unsubscribe = () => void;
 
+import {
+  parseContentParts,
+  type AttachmentKind,
+  type ContentPart,
+  type InboundAttachmentAvailable,
+  type InboundAttachmentFailed,
+  type InboundAttachmentReady,
+  type RegisterOutboundAttachmentInput,
+  type RegisterOutboundAttachmentResult,
+} from "./media.js";
 import { assertHttpsBaseUrl } from "./endpoint-url.js";
 import {
   createInsecureTlsFetch,
@@ -239,25 +285,49 @@ function parseApprovalPluginEvent(raw: unknown): ApprovalPluginEvent | null {
   return null;
 }
 
+function inboundQuerySuffix(params?: {
+  accountId?: string;
+  agentSurfaceId?: string;
+}): string {
+  const query = new URLSearchParams();
+  if (params?.accountId) {
+    query.set("account_id", params.accountId);
+  }
+  if (params?.agentSurfaceId) {
+    query.set("agent_surface_id", params.agentSurfaceId);
+  }
+  return query.size > 0 ? `?${query}` : "";
+}
+
+function accountQuerySuffix(accountId?: string): string {
+  return inboundQuerySuffix(accountId ? { accountId } : undefined);
+}
+
 function startReconnectingSse(params: {
-  connect: (signal: AbortSignal) => Promise<Response>;
-  onData: (data: string) => void;
+  connect: (signal: AbortSignal, lastEventId?: string) => Promise<Response>;
+  onData: (data: string, eventId?: string) => void;
   onError?: (err: Error) => void;
   errorLabel: string;
 }): Unsubscribe {
   const controller = new AbortController();
   void (async () => {
     let attempt = 0;
+    let lastEventId: string | undefined;
     while (!controller.signal.aborted) {
       try {
-        const response = await params.connect(controller.signal);
+        const response = await params.connect(controller.signal, lastEventId);
         if (!response.ok) {
           throw new Error(`${params.errorLabel}: ${response.status}`);
         }
         attempt = 0;
         await consumeSse(
           response,
-          (_eventName, data) => params.onData(data),
+          (_eventName, data, eventId) => {
+            if (eventId) {
+              lastEventId = eventId;
+            }
+            params.onData(data, eventId);
+          },
           controller.signal,
         );
       } catch (err) {
@@ -277,7 +347,7 @@ function startReconnectingSse(params: {
 
 async function consumeSse(
   response: Response,
-  onEvent: (eventName: string, data: string) => void,
+  onEvent: (eventName: string, data: string, eventId?: string) => void,
   signal?: AbortSignal,
 ): Promise<void> {
   if (!response.body) {
@@ -287,16 +357,19 @@ async function consumeSse(
   const decoder = new TextDecoder();
   let buffer = "";
   let eventName = "message";
+  let eventId: string | undefined;
   let dataLines: string[] = [];
 
   const flush = () => {
     if (dataLines.length === 0) {
+      eventId = undefined;
       return;
     }
     const payload =
       dataLines.length === 1 ? dataLines[0] : dataLines.join("\n");
-    onEvent(eventName, payload);
+    onEvent(eventName, payload, eventId);
     eventName = "message";
+    eventId = undefined;
     dataLines = [];
   };
 
@@ -315,6 +388,8 @@ async function consumeSse(
         flush();
       } else if (line.startsWith("event:")) {
         eventName = line.slice(6).trim();
+      } else if (line.startsWith("id:")) {
+        eventId = line.slice(3).trim();
       } else if (line.startsWith("data:")) {
         dataLines.push(line.slice(5).trimStart());
       }
@@ -354,40 +429,150 @@ export class LanglangbotSidecar {
   }
 
   subscribeInbound(
-    onMessage: (evt: InboundMessage) => void,
+    handler: InboundHandler | ((evt: InboundMessage) => void),
+    onError?: (err: Error) => void,
+  ): Unsubscribe;
+  subscribeInbound(
+    params: InboundSubscriptionParams,
+    handler: InboundHandler | ((evt: InboundMessage) => void),
+    onError?: (err: Error) => void,
+  ): Unsubscribe;
+  subscribeInbound(
+    paramsOrOnMessage:
+      | InboundSubscriptionParams
+      | InboundHandler
+      | ((evt: InboundMessage) => void),
+    onMessageOrError?:
+      | InboundHandler
+      | ((evt: InboundMessage) => void)
+      | ((err: Error) => void),
     onError?: (err: Error) => void,
   ): Unsubscribe {
+    const hasParams =
+      typeof paramsOrOnMessage !== "function" &&
+      !isInboundHandler(paramsOrOnMessage);
+    const params = hasParams ? paramsOrOnMessage : undefined;
+    const handler = hasParams ? onMessageOrError : paramsOrOnMessage;
+    const callbacks: InboundHandler = isInboundHandler(handler)
+      ? handler
+      : typeof handler === "function"
+        ? { onMessage: handler as (evt: InboundMessage) => void }
+        : {};
+    const errorHandler =
+      hasParams
+        ? onError
+        : typeof onMessageOrError === "function"
+        ? (onMessageOrError as ((err: Error) => void) | undefined)
+        : onError;
+    const suffix = inboundQuerySuffix(params);
     return startReconnectingSse({
       errorLabel: "inbound SSE failed",
-      onError,
-      connect: (signal) =>
-        this.fetchImpl(`${this.baseUrl}/v1/inbound/events`, {
-          headers: this.headers({ accept: "text/event-stream" }),
+      onError: errorHandler,
+      connect: (signal, lastEventId) =>
+        this.fetchImpl(`${this.baseUrl}/v1/inbound/events${suffix}`, {
+          headers: this.headers({
+            accept: "text/event-stream",
+            ...(lastEventId ? { "Last-Event-ID": lastEventId } : {}),
+          }),
           signal,
         }),
-      onData: (data) => {
+      onData: (data, eventId) => {
         try {
-          const parsed = JSON.parse(data) as {
-            conversation_id?: string;
-            message_id?: string;
-            text?: string;
-            received_at?: string;
-            operator_surface_id?: string;
-          };
+          const parsed = JSON.parse(data) as Record<string, unknown>;
           if (
-            !parsed.conversation_id ||
-            !parsed.message_id ||
-            typeof parsed.text !== "string"
+            parsed.conversation_id &&
+            parsed.message_id &&
+            typeof parsed.text === "string" &&
+            parsed.received_at
           ) {
+            callbacks.onMessage?.({
+              conversationId: String(parsed.conversation_id),
+              messageId: String(parsed.message_id),
+              text: String(parsed.text),
+              parts: parseContentParts(parsed.parts),
+              receivedAt: String(parsed.received_at),
+              seq: eventId?.trim() || undefined,
+              ownerSurfaceId:
+                typeof parsed.owner_surface_id === "string"
+                  ? parsed.owner_surface_id.trim() || undefined
+                  : undefined,
+            });
             return;
           }
-          onMessage({
-            conversationId: parsed.conversation_id,
-            messageId: parsed.message_id,
-            text: parsed.text,
-            receivedAt: parsed.received_at ?? new Date().toISOString(),
-            operatorSurfaceId: parsed.operator_surface_id?.trim() || undefined,
-          });
+          if (parsed.upload_id && parsed.attachment_id && parsed.conversation_id) {
+            callbacks.onAttachmentReady?.({
+              conversationId: String(parsed.conversation_id),
+              messageId:
+                parsed.message_id == null
+                  ? undefined
+                  : String(parsed.message_id),
+              uploadId: String(parsed.upload_id),
+              attachmentId: String(parsed.attachment_id),
+              filename: String(parsed.filename ?? "attachment"),
+              mime: String(parsed.mime ?? "application/octet-stream"),
+              kind: String(parsed.kind ?? "file") as AttachmentKind,
+              size: Number(parsed.size ?? 0),
+              downloadUrl: String(parsed.download_url ?? ""),
+              localPath:
+                parsed.local_path == null
+                  ? undefined
+                  : String(parsed.local_path),
+              readyAt: String(parsed.ready_at ?? new Date().toISOString()),
+              seq: eventId?.trim() || undefined,
+            });
+            return;
+          }
+          if (
+            parsed.upload_id &&
+            parsed.conversation_id &&
+            typeof parsed.reason === "string" &&
+            parsed.attachment_id == null &&
+            parsed.bytes_available == null
+          ) {
+            callbacks.onAttachmentFailed?.({
+              conversationId: String(parsed.conversation_id),
+              messageId:
+                parsed.message_id == null
+                  ? undefined
+                  : String(parsed.message_id),
+              uploadId: String(parsed.upload_id),
+              filename: String(parsed.filename ?? "attachment"),
+              mime: String(parsed.mime ?? "application/octet-stream"),
+              kind: String(parsed.kind ?? "file") as AttachmentKind,
+              size: Number(parsed.size ?? 0),
+              reason: String(parsed.reason),
+              failedAt: String(parsed.failed_at ?? new Date().toISOString()),
+              seq: eventId?.trim() || undefined,
+            });
+            return;
+          }
+          if (
+            parsed.upload_id &&
+            parsed.conversation_id &&
+            parsed.bytes_available != null &&
+            parsed.local_path
+          ) {
+            callbacks.onAttachmentAvailable?.({
+              conversationId: String(parsed.conversation_id),
+              messageId:
+                parsed.message_id == null
+                  ? undefined
+                  : String(parsed.message_id),
+              uploadId: String(parsed.upload_id),
+              filename: String(parsed.filename ?? "attachment"),
+              mime: String(parsed.mime ?? "application/octet-stream"),
+              kind: String(parsed.kind ?? "file") as AttachmentKind,
+              bytesAvailable: Number(parsed.bytes_available ?? 0),
+              size: Number(parsed.size ?? 0),
+              localPath: String(parsed.local_path),
+              streamable: Boolean(parsed.streamable),
+              final: Boolean(parsed.final),
+              updatedAt: String(parsed.updated_at ?? new Date().toISOString()),
+              seq: eventId?.trim() || undefined,
+            });
+            return;
+          }
+
         } catch (err) {
           if (err instanceof SyntaxError) {
             return;
@@ -396,6 +581,21 @@ export class LanglangbotSidecar {
         }
       },
     });
+  }
+
+  async ackInbound(input: {
+    cursor: string;
+    accountId?: string;
+  }): Promise<void> {
+    const suffix = accountQuerySuffix(input.accountId);
+    const response = await this.fetchImpl(`${this.baseUrl}/v1/inbound/ack${suffix}`, {
+      method: "POST",
+      headers: this.headers(),
+      body: JSON.stringify({ cursor: input.cursor }),
+    });
+    if (!response.ok) {
+      throw new Error(`ackInbound failed: ${response.status}`);
+    }
   }
 
   subscribeApprovalPluginEvents(
@@ -437,6 +637,30 @@ export class LanglangbotSidecar {
     );
     if (!response.ok) {
       throw new Error(`sendDelta failed: ${response.status}`);
+    }
+  }
+
+  /** Report an agent turn phase for Operator conversation SSE (`agent_turn`). */
+  async reportTurnPhase(
+    conversationId: string,
+    messageId: string,
+    phase: AgentTurnPhase,
+    detail?: string,
+  ): Promise<void> {
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/v1/conversations/${conversationId}/outbound/turn`,
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          message_id: messageId,
+          phase,
+          ...(detail !== undefined ? { detail } : {}),
+        }),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`reportTurnPhase failed: ${response.status}`);
     }
   }
 
@@ -541,6 +765,7 @@ export class LanglangbotSidecar {
     conversationId: string,
     text: string,
     messageId?: string,
+    parts?: ContentPart[],
   ): Promise<{ message_id: string }> {
     const response = await this.fetchImpl(
       `${this.baseUrl}/v1/conversations/${conversationId}/outbound/message`,
@@ -550,6 +775,7 @@ export class LanglangbotSidecar {
         body: JSON.stringify({
           text,
           message_id: messageId,
+          parts: parts ?? [],
         }),
       },
     );
@@ -564,11 +790,7 @@ export class LanglangbotSidecar {
     onEvent: (evt: ManagementRequestEvent) => void,
     onError?: (err: Error) => void,
   ): Unsubscribe {
-    const query = new URLSearchParams();
-    if (params?.accountId) {
-      query.set("account_id", params.accountId);
-    }
-    const suffix = query.size > 0 ? `?${query}` : "";
+    const suffix = accountQuerySuffix(params?.accountId);
     return startReconnectingSse({
       errorLabel: "management SSE failed",
       onError,
@@ -693,5 +915,60 @@ export class LanglangbotSidecar {
       throw new Error(`setAgentModel failed: ${response.status}`);
     }
     return (await response.json()) as Record<string, unknown>;
+  }
+
+  async registerOutboundAttachment(
+    conversationId: string,
+    input: RegisterOutboundAttachmentInput,
+    accountId = "default",
+  ): Promise<RegisterOutboundAttachmentResult> {
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/v1/conversations/${conversationId}/outbound/attachments`,
+      {
+        method: "POST",
+        headers: {
+          ...this.headers(),
+          "x-langlangbot-account-id": accountId,
+        },
+        body: JSON.stringify({
+          local_path: input.localPath,
+          filename: input.filename,
+          mime: input.mime,
+          sha256: input.sha256,
+          status: input.status,
+        }),
+      },
+    );
+    if (!response.ok) {
+      // The sidecar explains itself in the body (attachment_too_large,
+      // content_mismatch with a reason, the offending path vs its media root).
+      // A bare status code turns all of that into the same mystery 500.
+      const detail = await response.text().catch(() => "");
+      throw new Error(
+        `registerOutboundAttachment failed: ${response.status}${detail ? ` ${detail}` : ""}`,
+      );
+    }
+    return (await response.json()) as RegisterOutboundAttachmentResult;
+  }
+
+  async markOutboundAttachmentReady(
+    conversationId: string,
+    attachmentId: string,
+  ): Promise<{ attachment_id: string; status: string; download_url: string }> {
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/v1/conversations/${conversationId}/outbound/attachments/${attachmentId}/ready`,
+      {
+        method: "POST",
+        headers: this.headers(),
+      },
+    );
+    if (!response.ok) {
+      throw new Error(`markOutboundAttachmentReady failed: ${response.status}`);
+    }
+    return (await response.json()) as {
+      attachment_id: string;
+      status: string;
+      download_url: string;
+    };
   }
 }

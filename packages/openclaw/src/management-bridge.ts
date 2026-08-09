@@ -28,7 +28,7 @@ export function startManagementBridge(params: {
           );
           const result = await handleManagementRequest(
             evt as ManagementRequestPayload,
-            account.accountId,
+            account,
           );
           await sidecar.postManagementResult(evt.request_id, {
             ok: true,

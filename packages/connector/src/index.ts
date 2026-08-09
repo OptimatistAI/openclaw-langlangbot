@@ -1,6 +1,7 @@
 export {
   LanglangbotSidecar,
   type AgentStatusQuery,
+  type AgentTurnPhase,
   type ApprovalAction,
   type ApprovalDecisionPoll,
   type ApprovalPluginEvent,
@@ -11,7 +12,9 @@ export {
   isOpenClawApprovalKind,
   normalizeApprovalKind,
   type HealthStatus,
+  type InboundHandler,
   type InboundMessage,
+  type InboundSubscriptionParams,
   type LanglangbotSidecarOptions,
   type AgentRuntimeStatusUpdate,
   type ManagementRequestEvent,
@@ -22,6 +25,18 @@ export {
   type RegisterPendingApprovalInput,
   type Unsubscribe,
 } from "./client.js";
+export {
+  parseContentParts,
+  textFromParts,
+  type AttachmentKind,
+  type AttachmentStatus,
+  type ContentPart,
+  type InboundAttachmentAvailable,
+  type InboundAttachmentFailed,
+  type InboundAttachmentReady,
+  type RegisterOutboundAttachmentInput,
+  type RegisterOutboundAttachmentResult,
+} from "./media.js";
 export {
   HTTPS_SCHEME,
   TLS_FINGERPRINT_PREFIX,

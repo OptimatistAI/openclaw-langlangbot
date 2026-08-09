@@ -9,7 +9,7 @@ import {
   parseConversationTarget,
   resolveLanglangbotAccount,
 } from "./config.js";
-import { resolveOperatorFrom } from "./operator-surface.js";
+import { resolveOwnerFrom } from "./owner-surface.js";
 import {
   isConversationUuid,
   resolveLanglangbotSessionConversationId,
@@ -55,8 +55,7 @@ export function resolveLanglangbotOutboundSessionRoute(
   const to = conversationTarget(conversationId);
   const account = resolveLanglangbotAccount(params.cfg, params.accountId);
   const accountId = account.accountId;
-  const from = resolveOperatorFrom({
-    configuredSurfaceId: account.surfaceId,
+  const from = resolveOwnerFrom({
     conversationId,
   });
 
