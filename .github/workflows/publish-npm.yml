@@ -31,11 +31,38 @@ jobs:
             test -f "$pkg/LICENSE"
             node -e "const p=require('./$pkg/package.json'); if(!p.license) process.exit(1)"
           done
+
+      # npm hands out the `latest` dist-tag to whatever it publishes unless told
+      # otherwise, so a release candidate would become the default install for
+      # everyone. Prereleases go to `rc` instead.
+      - name: Resolve version and dist-tag
+        id: npm
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./packages/openclaw/package.json').version")"
+          connector="$(node -p "require('./packages/connector/package.json').version")"
+          if [[ "$connector" != "$version" ]]; then
+            echo "connector is $connector but openclaw is $version; bump them together"
+            exit 1
+          fi
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "${GITHUB_REF_NAME}" != "npm-v${version}" ]]; then
+            echo "tag ${GITHUB_REF_NAME} does not match package version ${version}"
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            echo "dist_tag=rc" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - run: npm ci
       - run: npm run build
-      - run: npm publish --workspace=@optimatist/langlangbot-connector --access public
+      - name: Publish ${{ steps.npm.outputs.version }} under @${{ steps.npm.outputs.dist_tag }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish --workspace=@optimatist/langlangbot-openclaw --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          DIST_TAG: ${{ steps.npm.outputs.dist_tag }}
+        run: |
+          set -euo pipefail
+          npm publish --workspace=@optimatist/langlangbot-connector --access public --tag "$DIST_TAG"
+          npm publish --workspace=@optimatist/langlangbot-openclaw --access public --tag "$DIST_TAG"
