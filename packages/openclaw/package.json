@@ -1,6 +1,6 @@
 {
   "name": "@optimatist/langlangbot-openclaw",
-  "version": "0.1.19",
+  "version": "0.1.20-rc.3",
   "description": "OpenClaw channel plugin for LangLangBot (Operator chat and approvals)",
   "license": "MIT",
   "repository": {
@@ -15,7 +15,7 @@
   "type": "module",
   "main": "./dist/index.js",
   "dependencies": {
-    "@optimatist/langlangbot-connector": "0.1.19"
+    "@optimatist/langlangbot-connector": "0.1.20-rc.3"
   },
   "devDependencies": {
     "esbuild": "^0.25.5",
