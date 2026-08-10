@@ -5,6 +5,7 @@ import {
   resolveLanglangbotAccount,
   type LanglangbotAccount,
 } from "./config.js";
+import { outboundExportDir, sendOutboundFiles } from "./outbound-media.js";
 import { getLanglangbotApprovalCapability } from "./approval-capability.js";
 import { startLanglangbotGateway } from "./gateway.js";
 import {
@@ -28,6 +29,7 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
   capabilities: {
     chatTypes: ["direct"],
     blockStreaming: false,
+    media: true,
   },
   approvalCapability: getLanglangbotApprovalCapability(),
   config: {
@@ -88,6 +90,32 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
         messageId: result.message_id,
       };
     },
+    sendMedia: async ({ to, text, mediaUrl, cfg, accountId }) => {
+      const account = resolveLanglangbotAccount(cfg, accountId);
+      const normalized = normalizeLanglangbotDeliveryTarget(to);
+      const conversationId = parseConversationTarget(normalized ?? to);
+      if (!conversationId) {
+        throw new Error(`langlangbot: invalid target ${to}`);
+      }
+      const localPath = mediaUrl?.trim();
+      if (!localPath) {
+        throw new Error("langlangbot: mediaUrl (absolute local path) is required");
+      }
+      const sidecar = createLanglangbotSidecar(account);
+      const result = await sendOutboundFiles(
+        sidecar,
+        conversationId,
+        account.accountId,
+        [localPath],
+        // The tool's own text, if any. No fallback caption: the filename
+        // already travels on the attachment part.
+        text?.trim() || undefined,
+      );
+      return {
+        channel: "langlangbot",
+        messageId: result.messageId,
+      };
+    },
   },
   gateway: {
     startAccount: async (ctx) => {
@@ -105,9 +133,12 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
   agentPrompt: {
     messageToolHints: () => [
       "LangLangBot delivery target is conversation:<uuid> from the active session key.",
-      "Operator chat sets OwnerAllowFrom from ODA-attested operator_surface_id; cron tool is usually available without commands.ownerAllowFrom.",
+      "Operator chat sets OwnerAllowFrom from ODA-attested owner_surface_id; cron tool is usually available without commands.ownerAllowFrom.",
       "For Operator reminders via cron: payload.kind agentTurn, sessionTarget isolated, delivery { mode: announce } only (never channel without to). See langlangbot-channel skill.",
       "For Operator context/model questions (app runtime bar), call langlangbot_operator_runtime_status instead of session_status.",
+      "Operator only renders your reply text; tool results and reasoning never reach the app. Restate any tool output the user asked for, and never answer NO_REPLY to an explicit user request.",
+      "Pending inbound attachments: acknowledge intent, wait for attachment_ready before analyzing file contents.",
+      `Outbound files must be written to ${outboundExportDir()}/ (create it if missing) before sending to Operator.`,
     ],
   },
 };

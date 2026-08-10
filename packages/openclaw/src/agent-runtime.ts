@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { buildLanglangbotSessionKey } from "./session-key.js";
-import { formatError } from "./config.js";
+import { formatError, type LanglangbotAccount } from "./config.js";
 import { loadOpenclawSessionEntry, readJsonFile } from "./session-store.js";
 
 export type AgentModelChoice = {
@@ -377,6 +377,7 @@ async function loadSessionState(
 export async function getAgentSessionStatus(params: {
   accountId: string;
   conversationId: string;
+  agentId: string;
   scopes?: string[];
 }): Promise<AgentSessionStatus> {
   const sessionKey = buildLanglangbotSessionKey(params);
@@ -407,7 +408,7 @@ export async function getAgentSessionStatus(params: {
 
   return {
     session_key: sessionKey,
-    agent_id: "default",
+    agent_id: params.agentId,
     model,
     model_provider: modelProvider,
     context_tokens: asNumber(session?.contextTokens),
@@ -428,6 +429,7 @@ export async function getAgentSessionStatus(params: {
 export async function setAgentSessionModel(params: {
   accountId: string;
   conversationId: string;
+  agentId: string;
   model: string;
   scopes?: string[];
 }): Promise<{
@@ -470,14 +472,15 @@ export type ManagementRequestPayload = {
 
 export async function handleManagementRequest(
   payload: ManagementRequestPayload,
-  accountId: string,
+  account: LanglangbotAccount,
 ): Promise<Record<string, unknown>> {
   const conversationId = payload.conversation_id;
   switch (payload.operation) {
     case "status":
       return getAgentSessionStatus({
-        accountId,
+        accountId: account.accountId,
         conversationId,
+        agentId: account.agentId,
         scopes: payload.scopes,
       });
     case "models":
@@ -488,8 +491,9 @@ export async function handleManagementRequest(
         throw new Error("model is required for set_model");
       }
       return setAgentSessionModel({
-        accountId,
+        accountId: account.accountId,
         conversationId,
+        agentId: account.agentId,
         model,
         scopes: payload.scopes,
       });

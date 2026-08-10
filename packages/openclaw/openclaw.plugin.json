@@ -40,6 +40,10 @@
       "sidecarInsecureTls": {
         "type": "boolean",
         "default": true
+      },
+      "agentId": {
+        "type": "string",
+        "description": "OpenClaw agent id for session keys and provider auth. Defaults to the gateway default agent (usually main)."
       }
     }
   },
@@ -63,7 +67,11 @@
           "sidecarStartTimeoutMs": { "type": "number", "default": 30000 },
           "sidecarInsecureTls": { "type": "boolean", "default": true },
           "surfaceId": { "type": "string" },
-          "streaming": { "type": "boolean", "default": true }
+          "streaming": { "type": "boolean", "default": true },
+          "agentId": {
+            "type": "string",
+            "description": "OpenClaw agent id for session keys and provider auth. Defaults to the gateway default agent (usually main)."
+          }
         }
       }
     }
