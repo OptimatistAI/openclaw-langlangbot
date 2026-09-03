@@ -37,6 +37,12 @@ import {
   replaceAttachmentPart,
 } from "./media.js";
 import { sendOutboundFiles } from "./outbound-media.js";
+import {
+  AGENT_RUNTIME_KIND,
+  AGENT_RUNTIME_NAME,
+  adapterVersion,
+  hostVersion,
+} from "./runtime-identity.js";
 import { buildLanglangbotSessionKey } from "./session-key.js";
 import {
   setOpenclawSessionStoreConfig,
@@ -102,8 +108,6 @@ function logChatTiming(
     `[chat-timing] phase=${opts.phase} layer=plugin conversation=${opts.conversationId.toLowerCase()} message=${opts.messageId.toLowerCase()} assistant_message=${assistant} elapsed_ms=${opts.elapsedMs} wall=${chatTimingWall()}`,
   );
 }
-
-const AGENT_RUNTIME_NAME = "OpenClaw";
 
 /**
  * OpenClaw 6.10's buffered dispatcher installs a per-conversation foreground
@@ -881,6 +885,9 @@ async function reportAgentRuntimeStatus(
       connected,
       agentRuntimeReady: readiness.ready,
       runtimeName: AGENT_RUNTIME_NAME,
+      kind: AGENT_RUNTIME_KIND,
+      hostVersion: hostVersion(),
+      adapterVersion: adapterVersion(),
       accountId: ctx.account.accountId,
       reason: readiness.ready ? null : readiness.reason,
       lastDispatchError: readiness.ready ? null : readiness.reason,
