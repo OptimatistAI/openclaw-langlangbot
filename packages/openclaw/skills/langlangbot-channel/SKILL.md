@@ -15,10 +15,12 @@ curl -fsSL https://optimatist.ai/langlangbot/install.sh | bash
 2. **Pair** with iOS Operator (shown in the app after Agent surface creation):
 
 ```bash
-langlangbot pair --id <agent_surface_id>
+langlangbot pair ABC2-T9K4
 ```
 
-Confirm the 6-character code and TLS fingerprint in the Operator app when prompted.
+Copy the command as displayed (8-character short code, shown `XXXX-XXXX`). Tap
+approve on the phone after checking hostname / IP / OS / TLS fingerprint; do not
+type a confirmation code. Scripts may still use `langlangbot pair --id <base64>`.
 
 3. Configure OpenClaw — **LangLangBot starts automatically** when the gateway enables this channel (`autoStartSidecar: true` by default):
 
