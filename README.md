@@ -18,7 +18,7 @@ Sidecar binary and OpenClaw plugin (Linux and macOS Apple Silicon):
 
 ```bash
 curl -fsSL https://optimatist.ai/langlangbot/install.sh | bash
-langlangbot pair --id <agent_surface_id>
+langlangbot pair ABC2-T9K4
 ```
 
 Plugin only:
