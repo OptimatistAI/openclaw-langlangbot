@@ -154,6 +154,10 @@ export type AgentRuntimeStatusUpdate = {
   connected: boolean;
   agentRuntimeReady: boolean;
   runtimeName?: string;
+  /** Stable kind: `openclaw` | `hermes` | `unknown`. */
+  kind?: string | null;
+  hostVersion?: string | null;
+  adapterVersion?: string | null;
   accountId?: string;
   reason?: string | null;
   lastDispatchError?: string | null;
@@ -197,6 +201,9 @@ function isInboundHandler(value: unknown): value is InboundHandler {
 export type HealthStatus = {
   status: string;
   server_time?: string;
+  instance_id?: string;
+  configured_surface_id?: string | null;
+  makway_enabled?: boolean;
 };
 
 export type Unsubscribe = () => void;
@@ -672,6 +679,9 @@ export class LanglangbotSidecar {
         connected: input.connected,
         agent_runtime_ready: input.agentRuntimeReady,
         runtime_name: input.runtimeName,
+        kind: input.kind ?? undefined,
+        host_version: input.hostVersion ?? undefined,
+        adapter_version: input.adapterVersion ?? undefined,
         account_id: input.accountId,
         reason: input.reason,
         last_dispatch_error: input.lastDispatchError,
