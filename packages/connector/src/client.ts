@@ -154,6 +154,10 @@ export type AgentRuntimeStatusUpdate = {
   connected: boolean;
   agentRuntimeReady: boolean;
   runtimeName?: string;
+  /** Stable kind: `openclaw` | `hermes` | `unknown`. */
+  kind?: string | null;
+  hostVersion?: string | null;
+  adapterVersion?: string | null;
   accountId?: string;
   reason?: string | null;
   lastDispatchError?: string | null;
@@ -165,7 +169,10 @@ export type InboundMessage = {
   text: string;
   parts: ContentPart[];
   receivedAt: string;
-  /** SSE `id:` from `/v1/inbound/events`; pass to `ackInbound` after successful dispatch. */
+  /**
+   * SSE `id:` from `/v1/inbound/events`.
+   * Pass the seq set to `acceptInbound` before starting a turn.
+   */
   seq?: string;
   /** Base64 owner surface id attested by LangLangBot after ODA session.open. */
   ownerSurfaceId?: string;
@@ -197,6 +204,9 @@ function isInboundHandler(value: unknown): value is InboundHandler {
 export type HealthStatus = {
   status: string;
   server_time?: string;
+  instance_id?: string;
+  configured_surface_id?: string | null;
+  makway_enabled?: boolean;
 };
 
 export type Unsubscribe = () => void;
@@ -398,6 +408,42 @@ async function consumeSse(
   }
 }
 
+/** HTTP failure that keeps the status and parsed error body. */
+export class SidecarRequestError extends Error {
+  readonly status: number;
+  readonly errorCode?: string;
+  readonly body: unknown;
+
+  constructor(operation: string, status: number, body: unknown) {
+    super(`${operation} failed: ${status}`);
+    this.name = "SidecarRequestError";
+    this.status = status;
+    this.body = body;
+    if (body && typeof body === "object" && "error" in body) {
+      const code = (body as { error?: unknown }).error;
+      if (typeof code === "string" && code.trim()) {
+        this.errorCode = code;
+      }
+    }
+  }
+}
+
+async function sidecarRequestError(
+  operation: string,
+  response: Response,
+): Promise<SidecarRequestError> {
+  let body: unknown;
+  const text = await response.text().catch(() => "");
+  if (text) {
+    try {
+      body = JSON.parse(text) as unknown;
+    } catch {
+      body = text;
+    }
+  }
+  return new SidecarRequestError(operation, response.status, body);
+}
+
 export class LanglangbotSidecar {
   readonly baseUrl: string;
   readonly pluginToken?: string;
@@ -583,19 +629,45 @@ export class LanglangbotSidecar {
     });
   }
 
-  async ackInbound(input: {
-    cursor: string;
+  /**
+   * Claim one inbound message before starting a model turn.
+   *
+   * `accepted` is the first claim. `duplicate` means the sidecar already
+   * owns the message, including after a crash between accept and the model
+   * run — that message is not replayed, and the user sends it again.
+   * Named seqs are deleted either way. Inbound `Last-Event-ID` is not an
+   * inbound claim.
+   */
+  async acceptInbound(input: {
+    conversationId: string;
+    messageId: string;
+    seqs: string[];
     accountId?: string;
-  }): Promise<void> {
+  }): Promise<{ accepted: boolean; duplicate: boolean }> {
     const suffix = accountQuerySuffix(input.accountId);
-    const response = await this.fetchImpl(`${this.baseUrl}/v1/inbound/ack${suffix}`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ cursor: input.cursor }),
-    });
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/v1/inbound/accept${suffix}`,
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          conversation_id: input.conversationId,
+          message_id: input.messageId,
+          seqs: input.seqs,
+        }),
+      },
+    );
     if (!response.ok) {
-      throw new Error(`ackInbound failed: ${response.status}`);
+      throw await sidecarRequestError("acceptInbound", response);
     }
+    const body = (await response.json()) as {
+      accepted?: boolean;
+      duplicate?: boolean;
+    };
+    return {
+      accepted: body.accepted === true,
+      duplicate: body.duplicate === true,
+    };
   }
 
   subscribeApprovalPluginEvents(
@@ -636,7 +708,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`sendDelta failed: ${response.status}`);
+      throw await sidecarRequestError("sendDelta", response);
     }
   }
 
@@ -660,7 +732,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`reportTurnPhase failed: ${response.status}`);
+      throw await sidecarRequestError("reportTurnPhase", response);
     }
   }
 
@@ -672,6 +744,9 @@ export class LanglangbotSidecar {
         connected: input.connected,
         agent_runtime_ready: input.agentRuntimeReady,
         runtime_name: input.runtimeName,
+        kind: input.kind ?? undefined,
+        host_version: input.hostVersion ?? undefined,
+        adapter_version: input.adapterVersion ?? undefined,
         account_id: input.accountId,
         reason: input.reason,
         last_dispatch_error: input.lastDispatchError,
@@ -780,7 +855,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`sendMessage failed: ${response.status}`);
+      throw await sidecarRequestError("sendMessage", response);
     }
     return (await response.json()) as { message_id: string };
   }

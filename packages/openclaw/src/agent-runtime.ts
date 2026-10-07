@@ -4,6 +4,12 @@ import { dirname, join } from "node:path";
 
 import { buildLanglangbotSessionKey } from "./session-key.js";
 import { formatError, type LanglangbotAccount } from "./config.js";
+import {
+  AGENT_RUNTIME_KIND,
+  AGENT_RUNTIME_NAME,
+  adapterVersion,
+  hostVersion,
+} from "./runtime-identity.js";
 import { loadOpenclawSessionEntry, readJsonFile } from "./session-store.js";
 
 export type AgentModelChoice = {
@@ -29,6 +35,10 @@ export type AgentSessionStatus = {
   total_tokens_fresh?: boolean | null;
   multimodal?: boolean | null;
   measurement: "session_store" | "unknown";
+  runtime_kind?: string;
+  runtime_name?: string;
+  host_version?: string | null;
+  adapter_version?: string | null;
 };
 
 type GatewayModelRow = {
@@ -423,6 +433,11 @@ export async function getAgentSessionStatus(params: {
         : null,
     multimodal: isMultimodalModel(modelCatalog, model, modelProvider),
     measurement: session ? "session_store" : "unknown",
+    // Host identity (also reported via PUT /v1/plugin/runtime/status).
+    runtime_kind: AGENT_RUNTIME_KIND,
+    runtime_name: AGENT_RUNTIME_NAME,
+    host_version: hostVersion(),
+    adapter_version: adapterVersion(),
   };
 }
 

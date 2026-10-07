@@ -35,7 +35,7 @@ export type InboundAttachmentReady = {
   downloadUrl: string;
   localPath?: string;
   readyAt: string;
-  /** SSE `id:`; pass to `ackInbound`. */
+  /** SSE `id:`; pass to `acceptInbound`. */
   seq?: string;
 };
 
@@ -52,7 +52,7 @@ export type InboundAttachmentAvailable = {
   streamable: boolean;
   final: boolean;
   updatedAt: string;
-  /** SSE `id:`; pass to `ackInbound`. */
+  /** SSE `id:`; pass to `acceptInbound`. */
   seq?: string;
 };
 
@@ -66,7 +66,7 @@ export type InboundAttachmentFailed = {
   size: number;
   reason: string;
   failedAt: string;
-  /** SSE `id:`; pass to `ackInbound`. */
+  /** SSE `id:`; pass to `acceptInbound`. */
   seq?: string;
 };
 

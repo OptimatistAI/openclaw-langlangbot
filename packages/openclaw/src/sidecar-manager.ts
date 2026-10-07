@@ -11,6 +11,11 @@ import {
   type SidecarLog,
 } from "./config.js";
 import { DEFAULT_SIDECAR_PORT } from "./defaults.js";
+import {
+  overlaySidecarEnv,
+  parseSidecarEnvFile,
+  shouldTakeOverExternalSidecar,
+} from "./sidecar-env.js";
 
 type ManagedEntry = {
   child: ChildProcess;
@@ -19,8 +24,18 @@ type ManagedEntry = {
   account: LanglangbotAccount;
 };
 
+type ExternalWatch = {
+  refCount: number;
+  account: LanglangbotAccount;
+  log?: SidecarLog;
+  timer?: ReturnType<typeof setInterval>;
+  inFlight?: Promise<void>;
+};
+
 const managedByUrl = new Map<string, ManagedEntry>();
 const startInFlight = new Map<string, Promise<void>>();
+const externalWatchByUrl = new Map<string, ExternalWatch>();
+export const EXTERNAL_HEALTH_WATCH_MS = 2_000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -50,28 +65,7 @@ async function fileExists(filePath: string): Promise<boolean> {
 }
 
 async function loadEnvFile(filePath: string): Promise<Record<string, string>> {
-  const text = await readFile(filePath, "utf8");
-  const env: Record<string, string> = {};
-  for (const line of text.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) {
-      continue;
-    }
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) {
-      continue;
-    }
-    const key = trimmed.slice(0, eq).trim();
-    let value = trimmed.slice(eq + 1).trim();
-    if (
-      (value.startsWith('"') && value.endsWith('"')) ||
-      (value.startsWith("'") && value.endsWith("'"))
-    ) {
-      value = value.slice(1, -1);
-    }
-    env[key] = value;
-  }
-  return env;
+  return parseSidecarEnvFile(await readFile(filePath, "utf8"));
 }
 
 async function resolveLanglangbotBinary(explicit?: string): Promise<string> {
@@ -120,7 +114,9 @@ async function resolveLanglangbotBinary(explicit?: string): Promise<string> {
 }
 
 async function buildChildEnv(account: LanglangbotAccount): Promise<NodeJS.ProcessEnv> {
-  const env: NodeJS.ProcessEnv = { ...process.env };
+  // Rebuild on every spawn. ~/.langlangbot/env is the persistent source and
+  // must overwrite a stale LANGLANGBOT_SURFACE_ID inherited from the plugin.
+  let env: NodeJS.ProcessEnv = { ...process.env };
   env.LANGLANGBOT_BIND ||= defaultSidecarBind(account.sidecarUrl);
   if (account.pluginToken) {
     env.LANGLANGBOT_PLUGIN_TOKEN = account.pluginToken;
@@ -131,10 +127,7 @@ async function buildChildEnv(account: LanglangbotAccount): Promise<NodeJS.Proces
   const envPath =
     explicitEnvPath || ((await fileExists(defaultEnvPath)) ? defaultEnvPath : undefined);
   if (envPath) {
-    const fileEnv = await loadEnvFile(envPath);
-    for (const [key, value] of Object.entries(fileEnv)) {
-      env[key] = value;
-    }
+    env = overlaySidecarEnv(env, await loadEnvFile(envPath));
   }
 
   return env;
@@ -215,6 +208,83 @@ function pipeChildLogs(child: ChildProcess, log?: SidecarLog, prefix = "langlang
   });
 }
 
+function retainExternalWatch(account: LanglangbotAccount, log?: SidecarLog): void {
+  const existing = externalWatchByUrl.get(account.sidecarUrl);
+  if (existing) {
+    existing.refCount += 1;
+    existing.account = account;
+    existing.log = log;
+    return;
+  }
+  const entry: ExternalWatch = { refCount: 1, account, log };
+  externalWatchByUrl.set(account.sidecarUrl, entry);
+  startExternalHealthWatch(entry);
+}
+
+function startExternalHealthWatch(entry: ExternalWatch): void {
+  if (entry.timer) {
+    return;
+  }
+  entry.timer = setInterval(() => {
+    if (entry.inFlight) {
+      return;
+    }
+    entry.inFlight = maybeTakeOverExternalSidecar(entry).finally(() => {
+      entry.inFlight = undefined;
+    });
+  }, EXTERNAL_HEALTH_WATCH_MS);
+}
+
+async function maybeTakeOverExternalSidecar(entry: ExternalWatch): Promise<void> {
+  const url = entry.account.sidecarUrl;
+  const healthy = await isSidecarHealthy(entry.account);
+  if (
+    !shouldTakeOverExternalSidecar({
+      refCount: entry.refCount,
+      hasManagedChild: managedByUrl.has(url),
+      healthy,
+    })
+  ) {
+    return;
+  }
+  try {
+    entry.log?.info?.("[langlangbot] external sidecar left; supervisor taking over");
+    await startManagedSidecar(entry.account, entry.log);
+    const managed = managedByUrl.get(url);
+    if (managed) {
+      managed.refCount = entry.refCount;
+    }
+    stopExternalWatch(url);
+  } catch (err) {
+    entry.log?.warn?.(
+      `[langlangbot] supervisor takeover after external reload failed: ${formatError(err)}`,
+    );
+  }
+}
+
+function stopExternalWatch(url: string): void {
+  const entry = externalWatchByUrl.get(url);
+  if (!entry) {
+    return;
+  }
+  if (entry.timer) {
+    clearInterval(entry.timer);
+  }
+  externalWatchByUrl.delete(url);
+}
+
+function releaseExternalWatch(account: LanglangbotAccount): void {
+  const entry = externalWatchByUrl.get(account.sidecarUrl);
+  if (!entry) {
+    return;
+  }
+  entry.refCount -= 1;
+  if (entry.refCount > 0) {
+    return;
+  }
+  stopExternalWatch(account.sidecarUrl);
+}
+
 /**
  * Ensure LangLangBot is listening at account.sidecarUrl.
  * When autoStartSidecar is true (default), spawns the binary if /health is down.
@@ -224,6 +294,12 @@ export async function ensureLanglangbotSidecar(
   log?: SidecarLog,
 ): Promise<{ startedByPlugin: boolean }> {
   if (await isSidecarHealthy(account)) {
+    const managed = managedByUrl.get(account.sidecarUrl);
+    if (managed) {
+      managed.refCount += 1;
+    } else {
+      retainExternalWatch(account, log);
+    }
     return { startedByPlugin: false };
   }
 
@@ -317,6 +393,7 @@ export function releaseLanglangbotSidecar(
   account: LanglangbotAccount,
   log?: SidecarLog,
 ): void {
+  releaseExternalWatch(account);
   const entry = managedByUrl.get(account.sidecarUrl);
   if (!entry) {
     return;

@@ -1,5 +1,6 @@
 export {
   LanglangbotSidecar,
+  SidecarRequestError,
   type AgentStatusQuery,
   type AgentTurnPhase,
   type ApprovalAction,
