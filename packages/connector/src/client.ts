@@ -154,6 +154,10 @@ export type AgentRuntimeStatusUpdate = {
   connected: boolean;
   agentRuntimeReady: boolean;
   runtimeName?: string;
+  /** Stable kind: `openclaw` | `hermes` | `unknown`. */
+  kind?: string | null;
+  hostVersion?: string | null;
+  adapterVersion?: string | null;
   accountId?: string;
   reason?: string | null;
   lastDispatchError?: string | null;
@@ -165,7 +169,10 @@ export type InboundMessage = {
   text: string;
   parts: ContentPart[];
   receivedAt: string;
-  /** SSE `id:` from `/v1/inbound/events`; pass to `ackInbound` after successful dispatch. */
+  /**
+   * SSE `id:` from `/v1/inbound/events`.
+   * Pass the seq set to `acceptInbound` before starting a turn.
+   */
   seq?: string;
   /** Base64 owner surface id attested by LangLangBot after ODA session.open. */
   ownerSurfaceId?: string;
@@ -197,6 +204,11 @@ function isInboundHandler(value: unknown): value is InboundHandler {
 export type HealthStatus = {
   status: string;
   server_time?: string;
+  instance_id?: string;
+  configured_surface_id?: string | null;
+  /** Runtime kind recorded at pair time; null/absent means nothing paired yet. */
+  paired_runtime_kind?: string | null;
+  makway_enabled?: boolean;
 };
 
 export type Unsubscribe = () => void;
@@ -220,6 +232,12 @@ import {
 export type LanglangbotSidecarOptions = {
   baseUrl: string;
   pluginToken?: string;
+  /**
+   * Runtime kind this adapter identifies as, sent as
+   * `x-langlangbot-runtime-kind` on every request. When the sidecar was
+   * paired with a different runtime, inbound surfaces return 409.
+   */
+  runtimeKind?: string;
   /** Trust self-signed Agent cert (loopback OpenClaw plugin only). */
   insecureTls?: boolean;
   /** SPKI pin (`sha256/<hex>`) for Operator-style verification. */
@@ -303,6 +321,112 @@ function accountQuerySuffix(accountId?: string): string {
   return inboundQuerySuffix(accountId ? { accountId } : undefined);
 }
 
+/** Permanent 409 reasons from the sidecar's runtime-exclusivity gate. */
+export type RuntimeMismatchReason =
+  | "runtime_mismatch"
+  | "runtime_instance_mismatch"
+  | "runtime_pid_required";
+
+/**
+ * Permanent sidecar rejection (HTTP 409): wrong kind, same-kind different
+ * live PID, or kind without PID. Retrying cannot succeed — reconnect loops
+ * must terminate instead of backing off forever.
+ */
+export class RuntimeMismatchError extends Error {
+  /** The runtime kind the sidecar is paired with (`paired_runtime` body field). */
+  readonly pairedRuntime: string;
+  /** HTTP status the rejection arrived with (always 409 today). */
+  readonly status: number;
+  /** Distinguishes kind / instance / missing-PID permanent rejections. */
+  readonly reason: RuntimeMismatchReason;
+  /** Present for `runtime_instance_mismatch` when the sidecar reported it. */
+  readonly activePid?: number;
+
+  constructor(
+    pairedRuntime: string,
+    status = 409,
+    reason: RuntimeMismatchReason = "runtime_mismatch",
+    detail?: string,
+    activePid?: number,
+  ) {
+    super(detail ?? defaultMismatchDetail(pairedRuntime, reason, activePid));
+    this.name = "RuntimeMismatchError";
+    this.pairedRuntime = pairedRuntime;
+    this.status = status;
+    this.reason = reason;
+    this.activePid = activePid;
+  }
+}
+
+function defaultMismatchDetail(
+  pairedRuntime: string,
+  reason: RuntimeMismatchReason,
+  activePid?: number,
+): string {
+  if (reason === "runtime_instance_mismatch") {
+    return typeof activePid === "number"
+      ? `sidecar is already owned by another ${pairedRuntime} process (pid ${activePid}); stop that instance or wait for it to exit`
+      : `sidecar is already owned by another ${pairedRuntime} process`;
+  }
+  if (reason === "runtime_pid_required") {
+    return `sidecar requires X-Langlangbot-Runtime-Pid (paired with ${pairedRuntime})`;
+  }
+  return `sidecar is paired with ${pairedRuntime}; re-pair with --runtime ${pairedRuntime}`;
+}
+
+/** True when `err` is a permanent 409 runtime-exclusivity rejection. */
+export function isRuntimeMismatch(err: unknown): err is RuntimeMismatchError {
+  return err instanceof RuntimeMismatchError;
+}
+
+/** Parse a 409 body into the typed error when it is a permanent runtime rejection. */
+async function parseRuntimeMismatch(
+  response: Response,
+): Promise<RuntimeMismatchError | undefined> {
+  if (response.status !== 409) {
+    return undefined;
+  }
+  let body: unknown;
+  const text = await response.text().catch(() => "");
+  if (text) {
+    try {
+      body = JSON.parse(text) as unknown;
+    } catch {
+      body = text;
+    }
+  }
+  if (!body || typeof body !== "object") {
+    return undefined;
+  }
+  const error = (body as { error?: unknown }).error;
+  const pairedRuntimeRaw = (body as { paired_runtime?: unknown }).paired_runtime;
+  const pairedRuntime =
+    typeof pairedRuntimeRaw === "string" && pairedRuntimeRaw.trim()
+      ? pairedRuntimeRaw.trim()
+      : "another runtime";
+  if (error === "runtime_mismatch") {
+    return new RuntimeMismatchError(pairedRuntime, response.status, "runtime_mismatch");
+  }
+  if (error === "runtime_instance_mismatch") {
+    const activePid = (body as { active_pid?: unknown }).active_pid;
+    return new RuntimeMismatchError(
+      pairedRuntime,
+      response.status,
+      "runtime_instance_mismatch",
+      undefined,
+      typeof activePid === "number" ? activePid : undefined,
+    );
+  }
+  if (error === "runtime_pid_required") {
+    return new RuntimeMismatchError(
+      pairedRuntime,
+      response.status,
+      "runtime_pid_required",
+    );
+  }
+  return undefined;
+}
+
 function startReconnectingSse(params: {
   connect: (signal: AbortSignal, lastEventId?: string) => Promise<Response>;
   onData: (data: string, eventId?: string) => void;
@@ -310,13 +434,19 @@ function startReconnectingSse(params: {
   errorLabel: string;
 }): Unsubscribe {
   const controller = new AbortController();
-  void (async () => {
+  const run = (async () => {
     let attempt = 0;
     let lastEventId: string | undefined;
     while (!controller.signal.aborted) {
       try {
         const response = await params.connect(controller.signal, lastEventId);
         if (!response.ok) {
+          // A 409 runtime_mismatch is permanent: surface it to the caller and
+          // stop instead of retrying (any other status keeps the backoff).
+          const mismatch = await parseRuntimeMismatch(response);
+          if (mismatch) {
+            throw mismatch;
+          }
           throw new Error(`${params.errorLabel}: ${response.status}`);
         }
         attempt = 0;
@@ -334,6 +464,12 @@ function startReconnectingSse(params: {
         if (controller.signal.aborted) {
           return;
         }
+        if (isRuntimeMismatch(err)) {
+          // Permanent: rethrow unconditionally so callers see termination
+          // (the loop must not retry, back off, or swallow it).
+          params.onError?.(err);
+          throw err;
+        }
         const error = err instanceof Error ? err : new Error(String(err));
         params.onError?.(error);
         attempt += 1;
@@ -342,6 +478,10 @@ function startReconnectingSse(params: {
       }
     }
   })();
+  // The loop rethrows permanent (runtime-mismatch) failures so callers can
+  // await/inspect termination; the fire-and-forget subscription path must not
+  // turn that into an unhandled rejection on top of the onError callback.
+  run.catch(() => undefined);
   return () => controller.abort();
 }
 
@@ -398,14 +538,52 @@ async function consumeSse(
   }
 }
 
+/** HTTP failure that keeps the status and parsed error body. */
+export class SidecarRequestError extends Error {
+  readonly status: number;
+  readonly errorCode?: string;
+  readonly body: unknown;
+
+  constructor(operation: string, status: number, body: unknown) {
+    super(`${operation} failed: ${status}`);
+    this.name = "SidecarRequestError";
+    this.status = status;
+    this.body = body;
+    if (body && typeof body === "object" && "error" in body) {
+      const code = (body as { error?: unknown }).error;
+      if (typeof code === "string" && code.trim()) {
+        this.errorCode = code;
+      }
+    }
+  }
+}
+
+async function sidecarRequestError(
+  operation: string,
+  response: Response,
+): Promise<SidecarRequestError> {
+  let body: unknown;
+  const text = await response.text().catch(() => "");
+  if (text) {
+    try {
+      body = JSON.parse(text) as unknown;
+    } catch {
+      body = text;
+    }
+  }
+  return new SidecarRequestError(operation, response.status, body);
+}
+
 export class LanglangbotSidecar {
   readonly baseUrl: string;
   readonly pluginToken?: string;
+  readonly runtimeKind?: string;
   private readonly fetchImpl: typeof fetch;
 
   constructor(opts: LanglangbotSidecarOptions) {
     this.baseUrl = normalizeBaseUrl(opts.baseUrl);
     this.pluginToken = opts.pluginToken;
+    this.runtimeKind = opts.runtimeKind?.trim() || undefined;
     this.fetchImpl = opts.fetchImpl ?? createFetchImpl(opts);
   }
 
@@ -417,10 +595,20 @@ export class LanglangbotSidecar {
     if (this.pluginToken) {
       headers["x-langlangbot-plugin-token"] = this.pluginToken;
     }
+    if (this.runtimeKind) {
+      headers["x-langlangbot-runtime-kind"] = this.runtimeKind;
+    }
+    // Same-kind instance exclusivity: the sidecar records the first live PID
+    // and 409s any other process of the paired kind.
+    if (typeof process !== "undefined" && typeof process.pid === "number" && process.pid > 0) {
+      headers["x-langlangbot-runtime-pid"] = String(process.pid);
+    }
     return headers;
   }
 
   async health(): Promise<HealthStatus> {
+    // Deliberately sends no auth / runtime-kind headers: /health is the
+    // unauthenticated pairing-gate probe both plugins rely on before engaging.
     const response = await this.fetchImpl(`${this.baseUrl}/health`);
     if (!response.ok) {
       throw new Error(`health check failed: ${response.status}`);
@@ -583,19 +771,45 @@ export class LanglangbotSidecar {
     });
   }
 
-  async ackInbound(input: {
-    cursor: string;
+  /**
+   * Claim one inbound message before starting a model turn.
+   *
+   * `accepted` is the first claim. `duplicate` means the sidecar already
+   * owns the message, including after a crash between accept and the model
+   * run — that message is not replayed, and the user sends it again.
+   * Named seqs are deleted either way. Inbound `Last-Event-ID` is not an
+   * inbound claim.
+   */
+  async acceptInbound(input: {
+    conversationId: string;
+    messageId: string;
+    seqs: string[];
     accountId?: string;
-  }): Promise<void> {
+  }): Promise<{ accepted: boolean; duplicate: boolean }> {
     const suffix = accountQuerySuffix(input.accountId);
-    const response = await this.fetchImpl(`${this.baseUrl}/v1/inbound/ack${suffix}`, {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify({ cursor: input.cursor }),
-    });
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/v1/inbound/accept${suffix}`,
+      {
+        method: "POST",
+        headers: this.headers(),
+        body: JSON.stringify({
+          conversation_id: input.conversationId,
+          message_id: input.messageId,
+          seqs: input.seqs,
+        }),
+      },
+    );
     if (!response.ok) {
-      throw new Error(`ackInbound failed: ${response.status}`);
+      throw await sidecarRequestError("acceptInbound", response);
     }
+    const body = (await response.json()) as {
+      accepted?: boolean;
+      duplicate?: boolean;
+    };
+    return {
+      accepted: body.accepted === true,
+      duplicate: body.duplicate === true,
+    };
   }
 
   subscribeApprovalPluginEvents(
@@ -636,7 +850,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`sendDelta failed: ${response.status}`);
+      throw await sidecarRequestError("sendDelta", response);
     }
   }
 
@@ -660,7 +874,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`reportTurnPhase failed: ${response.status}`);
+      throw await sidecarRequestError("reportTurnPhase", response);
     }
   }
 
@@ -672,13 +886,17 @@ export class LanglangbotSidecar {
         connected: input.connected,
         agent_runtime_ready: input.agentRuntimeReady,
         runtime_name: input.runtimeName,
+        kind: input.kind ?? undefined,
+        host_version: input.hostVersion ?? undefined,
+        adapter_version: input.adapterVersion ?? undefined,
         account_id: input.accountId,
         reason: input.reason,
         last_dispatch_error: input.lastDispatchError,
       }),
     });
     if (!response.ok) {
-      throw new Error(`updateAgentRuntimeStatus failed: ${response.status}`);
+      // errorCode/status let callers detect the 409 runtime_mismatch verdict.
+      throw await sidecarRequestError("updateAgentRuntimeStatus", response);
     }
   }
 
@@ -700,7 +918,7 @@ export class LanglangbotSidecar {
       }),
     });
     if (!response.ok) {
-      throw new Error(`registerApprovalPending failed: ${response.status}`);
+      throw await sidecarRequestError("registerApprovalPending", response);
     }
     return (await response.json()) as { approval_id: string; status: string };
   }
@@ -780,7 +998,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`sendMessage failed: ${response.status}`);
+      throw await sidecarRequestError("sendMessage", response);
     }
     return (await response.json()) as { message_id: string };
   }
@@ -835,7 +1053,7 @@ export class LanglangbotSidecar {
       },
     );
     if (!response.ok) {
-      throw new Error(`postManagementResult failed: ${response.status}`);
+      throw await sidecarRequestError("postManagementResult", response);
     }
   }
 

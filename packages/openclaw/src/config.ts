@@ -3,6 +3,7 @@ import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
 
 import { resolveLanglangbotAgentId } from "./agent-id.js";
 import { DEFAULT_SIDECAR_URL } from "./defaults.js";
+import { AGENT_RUNTIME_KIND } from "./runtime-identity.js";
 
 export type LanglangbotAccount = {
   accountId: string;
@@ -106,6 +107,7 @@ export function createLanglangbotSidecar(account: LanglangbotAccount): Langlangb
   return new LanglangbotSidecar({
     baseUrl: account.sidecarUrl,
     pluginToken: account.pluginToken,
+    runtimeKind: AGENT_RUNTIME_KIND,
     insecureTls: account.sidecarInsecureTls,
   });
 }
