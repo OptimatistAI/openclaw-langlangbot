@@ -1,5 +1,6 @@
 import {
   isOpenClawApprovalDecision,
+  isRuntimeMismatch,
   type ApprovalPluginEvent,
   type OpenClawApprovalDecision,
   type Unsubscribe,
@@ -94,6 +95,14 @@ function ensureHub(account: LanglangbotAccount): HubState {
   const unsubscribe = sidecar.subscribeApprovalPluginEvents(
     (evt) => dispatchPluginEvent(account, evt),
     (err) => {
+      if (isRuntimeMismatch(err)) {
+        // Permanent: reconnect already stopped. Soft-idle only — do not
+        // escalate into the OpenClaw host.
+        console.warn(
+          `[langlangbot:approval] plugin SSE stopped (${key}): ${formatError(err)}`,
+        );
+        return;
+      }
       console.warn(
         `[langlangbot:approval] plugin SSE error (${key}): ${formatError(err)}`,
       );

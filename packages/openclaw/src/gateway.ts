@@ -1,7 +1,9 @@
-import type {
-  AgentTurnPhase,
-  ContentPart,
-  LanglangbotSidecar,
+import {
+  isRuntimeMismatch,
+  type AgentTurnPhase,
+  type ContentPart,
+  type HealthStatus,
+  type LanglangbotSidecar,
 } from "@optimatist/langlangbot-connector";
 import type { ChannelGatewayContext } from "openclaw/plugin-sdk/index";
 import type { ReplyPayload } from "openclaw/plugin-sdk/reply-payload";
@@ -26,6 +28,7 @@ import {
   ensureLanglangbotSidecar,
   releaseLanglangbotSidecar,
 } from "./sidecar-manager.js";
+import { shouldEngageSidecar } from "./pairing-gate.js";
 import { startManagementBridge } from "./management-bridge.js";
 import {
   attachmentAvailablePart,
@@ -37,6 +40,19 @@ import {
   replaceAttachmentPart,
 } from "./media.js";
 import { sendOutboundFiles } from "./outbound-media.js";
+import {
+  AGENT_RUNTIME_KIND,
+  AGENT_RUNTIME_NAME,
+  adapterVersion,
+  hostVersion,
+} from "./runtime-identity.js";
+import {
+  createSingleFlight,
+  createTurnLane,
+  finalizeIdleTurn,
+  isAgentTurnTerminalError,
+  shouldStartAcceptedTurn,
+} from "./turn-control.js";
 import { buildLanglangbotSessionKey } from "./session-key.js";
 import {
   setOpenclawSessionStoreConfig,
@@ -47,7 +63,7 @@ type InboundHandle = {
   conversationId: string;
   messageId: string;
   text: string;
-  /** Unacked inbound seqs (user_message + ready/failed); ack max after dispatch. */
+  /** Seqs deleted by the durable `/v1/inbound/accept` claim. */
   pendingAckSeqs: string[];
   parts: ContentPart[];
   ownerSurfaceId?: string;
@@ -59,23 +75,6 @@ function rememberAckSeq(handle: InboundHandle, seq?: string): void {
     return;
   }
   handle.pendingAckSeqs.push(trimmed);
-}
-
-/** Highest numeric seq for sidecar "ack up to cursor". */
-function maxAckSeq(seqs: string[]): string | undefined {
-  if (seqs.length === 0) {
-    return undefined;
-  }
-  let best = seqs[0]!;
-  let bestNum = Number(best);
-  for (const seq of seqs.slice(1)) {
-    const n = Number(seq);
-    if (Number.isFinite(n) && (!Number.isFinite(bestNum) || n > bestNum)) {
-      best = seq;
-      bestNum = n;
-    }
-  }
-  return best;
 }
 
 function chatTimingWall(): string {
@@ -103,8 +102,6 @@ function logChatTiming(
   );
 }
 
-const AGENT_RUNTIME_NAME = "OpenClaw";
-
 /**
  * OpenClaw 6.10's buffered dispatcher installs a per-conversation foreground
  * reply fence. Overlapping inbound.run turns on the same conversation can
@@ -130,11 +127,148 @@ function createConversationInboundQueue() {
   };
 }
 
+/** Cheap timeout-protected /health probe so a hung sidecar can't stall start. */
+async function probeSidecarHealth(
+  account: LanglangbotAccount,
+  timeoutMs = 3_000,
+): Promise<HealthStatus> {
+  const sidecar = createLanglangbotSidecar(account);
+  const probe = sidecar.health();
+  // Race the probe against a timer so a sidecar that accepts the connection
+  // but never answers cannot stall channel start (Node <18 compat: manual
+  // timer instead of AbortSignal.timeout).
+  const timeout = new Promise<never>((_resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`health probe timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+  });
+  return Promise.race([probe, timeout]);
+}
+
+type PairingGateDecision = { engage: true } | { engage: false; reason: string };
+
+/** Probe /health and decide engagement; unreachable sidecars keep legacy. */
+async function probePairingGate(
+  ctx: ChannelGatewayContext<LanglangbotAccount>,
+  probe = createLanglangbotSidecar(ctx.account),
+): Promise<PairingGateDecision> {
+  try {
+    const health = await probe.health();
+    return shouldEngageSidecar(
+      health.paired_runtime_kind,
+      AGENT_RUNTIME_KIND,
+    );
+  } catch (err) {
+    ctx.log?.debug?.(
+      `[langlangbot:${ctx.account.accountId}] pairing probe unreachable; continuing (${formatError(err)})`,
+    );
+    return { engage: true };
+  }
+}
+
+/**
+ * Hold the gateway in the idle state: set status, log once, then either
+ * self-heal (periodic re-probe flips back to engage after a re-pair) or wait
+ * for abort. `selfHeal` polls /health every 45s; a single timer, cleared on
+ * abort, never leaks.
+ */
+async function idleUntilRepairedOrAbort(
+  ctx: ChannelGatewayContext<LanglangbotAccount>,
+  reason?: string,
+  opts: { selfHeal?: boolean } = {},
+): Promise<void> {
+  const account = ctx.account;
+  const message = reason ?? "sidecar paired with another runtime";
+  ctx.log?.warn?.(`[langlangbot:${account.accountId}] ${message}`);
+  ctx.setStatus({
+    ...ctx.getStatus(),
+    running: false,
+    connected: false,
+    lastError: message,
+  });
+  // Hold the promise until the gateway is asked to stop (or, with selfHeal,
+  // until a re-probe says the sidecar now belongs to us), like a normal
+  // started-but-idle account, so the plugin host does not restart-loop us.
+  await new Promise<void>((resolve) => {
+    let selfHealTimer: ReturnType<typeof setInterval> | undefined;
+    const onAbort = () => {
+      if (selfHealTimer) {
+        clearInterval(selfHealTimer);
+      }
+      resolve();
+    };
+    if (opts.selfHeal) {
+      // Cheap periodic re-probe: a later re-pair must wake the idle channel
+      // (the abort signal alone never fires on a re-pair).
+      selfHealTimer = setInterval(() => {
+        void probePairingGate(ctx).then((decision) => {
+          if (decision.engage) {
+            if (selfHealTimer) {
+              clearInterval(selfHealTimer);
+              selfHealTimer = undefined;
+            }
+            ctx.log?.info?.(
+              `[langlangbot:${account.accountId}] sidecar re-paired to ${AGENT_RUNTIME_KIND}; resuming gateway`,
+            );
+            ctx.abortSignal.removeEventListener("abort", onAbort);
+            resolve();
+          }
+        });
+      }, 45_000);
+      if (typeof selfHealTimer.unref === "function") {
+        selfHealTimer.unref();
+      }
+    }
+    if (ctx.abortSignal.aborted) {
+      onAbort();
+      return;
+    }
+    ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export async function startLanglangbotGateway(
   ctx: ChannelGatewayContext<LanglangbotAccount>,
 ): Promise<void> {
   const account = ctx.account;
+
+  // Pairing-time exclusivity: a sidecar paired with another runtime keeps its
+  // inbound stream; this channel idles instead of stealing it. One cheap
+  // health probe decides; unreachable sidecars keep the legacy behavior.
+  const pairingGate = await probePairingGate(ctx);
+  if (!pairingGate.engage) {
+    await idleUntilRepairedOrAbort(ctx, pairingGate.reason);
+    return;
+  }
+
   const { startedByPlugin } = await ensureLanglangbotSidecar(account, ctx.log);
+  // Cold-start fix: ensureLanglangbotSidecar may have just spawned the sidecar;
+  // its paired kind is only knowable now. Re-probe once and idle when the
+  // (possibly freshly started) sidecar is paired with another runtime.
+  let postStartHealth: HealthStatus | undefined;
+  try {
+    postStartHealth = await probeSidecarHealth(account);
+  } catch (err) {
+    ctx.log?.debug?.(
+      `[langlangbot:${account.accountId}] post-start pairing probe failed; continuing (${formatError(err)})`,
+    );
+  }
+  if (postStartHealth) {
+    const postStartGate = shouldEngageSidecar(
+      postStartHealth.paired_runtime_kind,
+      AGENT_RUNTIME_KIND,
+    );
+    if (!postStartGate.engage) {
+      await idleUntilRepairedOrAbort(ctx, postStartGate.reason, {
+        selfHeal: true,
+      });
+      return;
+    }
+  }
 
   const sidecar = createLanglangbotSidecar(account);
 
@@ -178,10 +312,65 @@ export async function startLanglangbotGateway(
     `${conversationId}:${messageId}`;
   const uploadKey = (conversationId: string, uploadId: string) =>
     `${conversationId}:${uploadId}`;
+  const dropReplaySeqs = (inbound: {
+    conversationId: string;
+    messageId: string;
+    pendingAckSeqs: string[];
+  }) => {
+    if (!inbound.messageId || inbound.pendingAckSeqs.length === 0) {
+      return;
+    }
+    void enqueueInbound(inbound.conversationId, async () => {
+      await sidecar.acceptInbound({
+        conversationId: inbound.conversationId,
+        messageId: inbound.messageId,
+        seqs: inbound.pendingAckSeqs,
+        accountId: account.accountId,
+      });
+    }).catch((err) => {
+      ctx.log?.warn?.(
+        `[langlangbot:${account.accountId}] inbound accept failed for ${inbound.messageId}: ${formatError(err)}`,
+      );
+    });
+  };
+
   const dispatchInbound = (inbound: InboundHandle): void => {
-    void enqueueInbound(inbound.conversationId, () =>
-      handleInbound(inbound, ctx, sidecar),
-    ).catch(onInboundError);
+    const key = messageKey(inbound.conversationId, inbound.messageId);
+    if (dispatchedTerminalMessages.has(key)) {
+      dropReplaySeqs(inbound);
+      return;
+    }
+    dispatchedTerminalMessages.add(key);
+    void enqueueInbound(inbound.conversationId, async () => {
+      // Accept is the only inbound claim. On any accept failure (including a
+      // 404 from a sidecar without the endpoint) fail closed: do not dispatch;
+      // the message stays queued and replays on reconnect.
+      let claim;
+      try {
+        claim = await sidecar.acceptInbound({
+          conversationId: inbound.conversationId,
+          messageId: inbound.messageId,
+          seqs: inbound.pendingAckSeqs,
+          accountId: account.accountId,
+        });
+      } catch (err) {
+        dispatchedTerminalMessages.delete(key);
+        ctx.log?.warn?.(
+          `[langlangbot:${account.accountId}] inbound accept failed for ${inbound.messageId}: ${formatError(err)}`,
+        );
+        return;
+      }
+      if (!shouldStartAcceptedTurn(claim)) {
+        ctx.log?.info?.(
+          `[langlangbot:${account.accountId}] skip duplicate inbound ${inbound.messageId}`,
+        );
+        return;
+      }
+      await handleInbound(inbound, ctx, sidecar);
+    }).catch((err) => {
+      dispatchedTerminalMessages.delete(key);
+      onInboundError(err);
+    });
   };
 
   const resolvePendingKey = (
@@ -215,20 +404,6 @@ export async function startLanglangbotGateway(
     }
   };
 
-  const ackInboundSeqs = (seqs: string[]) => {
-    const cursor = maxAckSeq(seqs);
-    if (!cursor) {
-      return;
-    }
-    void sidecar
-      .ackInbound({ cursor, accountId: account.accountId })
-      .catch((err) => {
-        ctx.log?.warn?.(
-          `[langlangbot:${account.accountId}] inbound ack failed (seq=${cursor}): ${formatError(err)}`,
-        );
-      });
-  };
-
   // One agent turn per message_id (OpenClaw MessageSid dedupe); wait for all parts.
   const maybeDispatchTerminalAttachments = (
     key: string,
@@ -238,13 +413,11 @@ export async function startLanglangbotGateway(
       pendingAttachmentMessages.set(key, pending);
       return;
     }
+    clearPendingMessage(key, pending);
     if (dispatchedTerminalMessages.has(key)) {
-      clearPendingMessage(key, pending);
-      ackInboundSeqs(pending.pendingAckSeqs);
+      dropReplaySeqs(pending);
       return;
     }
-    dispatchedTerminalMessages.add(key);
-    clearPendingMessage(key, pending);
     ctx.log?.info?.(
       `[langlangbot:${account.accountId}] dispatching inbound message ${pending.messageId} after all attachments reached a terminal state`,
     );
@@ -269,8 +442,17 @@ export async function startLanglangbotGateway(
   ): void => {
     const terminalKey = uploadKey(evt.conversationId, evt.uploadId);
     if (processedTerminalUploads.has(terminalKey)) {
-      if (evt.seq) {
-        ackInboundSeqs([evt.seq]);
+      const messageId = evt.messageId;
+      if (
+        messageId &&
+        evt.seq &&
+        dispatchedTerminalMessages.has(messageKey(evt.conversationId, messageId))
+      ) {
+        dropReplaySeqs({
+          conversationId: evt.conversationId,
+          messageId,
+          pendingAckSeqs: [evt.seq],
+        });
       }
       return;
     }
@@ -296,11 +478,14 @@ export async function startLanglangbotGateway(
     const orphanKey = messageKey(evt.conversationId, messageId);
     if (dispatchedTerminalMessages.has(orphanKey)) {
       if (evt.seq) {
-        ackInboundSeqs([evt.seq]);
+        dropReplaySeqs({
+          conversationId: evt.conversationId,
+          messageId,
+          pendingAckSeqs: [evt.seq],
+        });
       }
       return;
     }
-    dispatchedTerminalMessages.add(orphanKey);
     const parts = [replacement];
     dispatchInbound({
       conversationId: evt.conversationId,
@@ -358,7 +543,20 @@ export async function startLanglangbotGateway(
           pendingAttachmentMessages.set(key, pending);
         }
         if (evt.seq) {
-          ackInboundSeqs([evt.seq]);
+          if (pending) {
+            rememberAckSeq(pending, evt.seq);
+          } else if (
+            evt.messageId &&
+            dispatchedTerminalMessages.has(
+              messageKey(evt.conversationId, evt.messageId),
+            )
+          ) {
+            dropReplaySeqs({
+              conversationId: evt.conversationId,
+              messageId: evt.messageId,
+              pendingAckSeqs: [evt.seq],
+            });
+          }
         }
       },
       onAttachmentReady: (evt) => {
@@ -369,6 +567,28 @@ export async function startLanglangbotGateway(
       },
     },
     (err) => {
+      if (isRuntimeMismatch(err)) {
+        // Re-paired under us: the sidecar 409s every subscription. Stop this
+        // subscription's reconnect loop cleanly and flip the channel into the
+        // idle state with the re-pair hint (the idle wait's self-heal probe
+        // resumes the gateway after a matching re-pair).
+        unsubscribe();
+        unsubscribeManagement();
+        void idleUntilRepairedOrAbort(
+          ctx,
+          `sidecar re-paired with ${err.pairedRuntime}; the openclaw channel stopped its subscription (${err.message})`,
+          { selfHeal: true },
+        ).then(() => {
+          // Reached only on abort; run the same teardown as a normal stop.
+          releaseLanglangbotSidecar(account, ctx.log);
+          ctx.setStatus({
+            ...ctx.getStatus(),
+            running: false,
+            connected: false,
+          });
+        });
+        return;
+      }
       ctx.log?.warn?.(
         `[langlangbot:${account.accountId}] inbound SSE error: ${err.message}`,
       );
@@ -682,8 +902,71 @@ async function handleInbound(
               );
             },
           },
-          runDispatch: () =>
-            runtime.reply.dispatchReplyWithBufferedBlockDispatcher({
+          runDispatch: () => {
+            const lane = createTurnLane();
+            const finalizeIdle = createSingleFlight(() =>
+              lane(() =>
+                finalizeIdleTurn({
+                  sendFinal: async () => {
+                    if (
+                      account.streaming &&
+                      streamState.streamedText &&
+                      !streamState.sentFinal
+                    ) {
+                      streamState.sentFinal = true;
+                      ctx.log?.info?.(
+                        `[langlangbot:${account.accountId}] outbound message onIdle (${streamState.streamedText.length} chars) → ${inbound.conversationId}`,
+                      );
+                      const flushed = await flushMedia(streamState.streamedText);
+                      if (flushed) {
+                        markOutboundFirst(flushed.messageId);
+                        markOutboundFinal(flushed.messageId);
+                        return;
+                      }
+                      const sent = await sidecar.sendMessage(
+                        inbound.conversationId,
+                        streamState.streamedText,
+                      );
+                      markOutboundFirst(sent.message_id);
+                      markOutboundFinal(sent.message_id);
+                      return;
+                    }
+                    const flushed = await flushMedia();
+                    if (flushed) {
+                      markOutboundFirst(flushed.messageId);
+                      markOutboundFinal(flushed.messageId);
+                    }
+                  },
+                  reportIdle: async () => {
+                    if (streamState.reportedIdle || turnFailed) {
+                      return;
+                    }
+                    if (typeof sidecar.reportTurnPhase !== "function") {
+                      reportPhase("idle");
+                      return;
+                    }
+                    streamState.reportedIdle = true;
+                    await sidecar.reportTurnPhase(
+                      inbound.conversationId,
+                      inbound.messageId,
+                      "idle",
+                    );
+                  },
+                  onRealFailure: (err) => {
+                    ctx.log?.error?.(
+                      `[langlangbot:${account.accountId}] outbound idle failed: ${formatError(err)}`,
+                    );
+                    reportPhase("failed", formatError(err));
+                  },
+                  onTerminalDuplicate: () => {
+                    ctx.log?.info?.(
+                      `[langlangbot:${account.accountId}] outbound already terminal for ${inbound.messageId}`,
+                    );
+                  },
+                }),
+              ),
+            );
+            return runtime.reply.dispatchReplyWithBufferedBlockDispatcher({
               ctx: ctxPayload,
               cfg,
               typingCallbacks: {
@@ -721,7 +1004,8 @@ async function handleInbound(
                 },
               },
               dispatcherOptions: {
-                deliver: async (payload: ReplyPayload, info: { kind?: string }) => {
+                deliver: (payload: ReplyPayload, info: { kind?: string }) =>
+                  lane(async () => {
                   collectMedia(payload);
                   const text = (payload.text ?? "").trim();
                   const kind = info.kind ?? "final";
@@ -783,49 +1067,15 @@ async function handleInbound(
                   const sent = await sidecar.sendMessage(inbound.conversationId, text);
                   markOutboundFirst(sent.message_id);
                   markOutboundFinal(sent.message_id);
-                },
-                onIdle: async () => {
-                  if (
-                    account.streaming &&
-                    streamState.streamedText &&
-                    !streamState.sentFinal
-                  ) {
-                    // Claim the send before awaiting: onIdle can fire twice
-                    // concurrently, which duplicated the final bubble.
-                    streamState.sentFinal = true;
+                }),
+                onIdle: () => finalizeIdle(),
+                onError: (err: unknown, info: { kind?: string }) => {
+                  if (isAgentTurnTerminalError(err)) {
                     ctx.log?.info?.(
-                      `[langlangbot:${account.accountId}] outbound message onIdle (${streamState.streamedText.length} chars) → ${inbound.conversationId}`,
+                      `[langlangbot:${account.accountId}] outbound already terminal for ${inbound.messageId}`,
                     );
-                    const flushed = await flushMedia(streamState.streamedText);
-                    if (flushed) {
-                      markOutboundFirst(flushed.messageId);
-                      markOutboundFinal(flushed.messageId);
-                    } else {
-                      const sent = await sidecar.sendMessage(
-                        inbound.conversationId,
-                        streamState.streamedText,
-                      );
-                      markOutboundFirst(sent.message_id);
-                      markOutboundFinal(sent.message_id);
-                    }
-                  } else {
-                    // Media-only turn, or attachments that arrived after the
-                    // final text was already delivered. Still an outbound
-                    // message, so it belongs on the turn's timing line.
-                    const flushed = await flushMedia();
-                    if (flushed) {
-                      markOutboundFirst(flushed.messageId);
-                      markOutboundFinal(flushed.messageId);
-                    }
-                  }
-                  if (streamState.reportedIdle) {
                     return;
                   }
-                  streamState.reportedIdle = true;
-                  // Turn end for this inbound message (including NO_REPLY).
-                  reportPhase("idle");
-                },
-                onError: (err: unknown, info: { kind?: string }) => {
                   ctx.log?.error?.(
                     `[langlangbot:${account.accountId}] outbound ${info.kind ?? "reply"} failed: ${
                       formatError(err)
@@ -834,26 +1084,12 @@ async function handleInbound(
                   reportPhase("failed", formatError(err));
                 },
               },
-            }),
+            });
+          },
         }),
       },
     });
     await reportAgentRuntimeStatus(sidecar, ctx, readiness);
-    const ackCursor = maxAckSeq(inbound.pendingAckSeqs);
-    if (ackCursor) {
-      try {
-        await sidecar.ackInbound({
-          cursor: ackCursor,
-          accountId: account.accountId,
-        });
-      } catch (err) {
-        ctx.log?.warn?.(
-          `[langlangbot:${account.accountId}] inbound ack failed (seq=${ackCursor}): ${
-            formatError(err)
-          }`,
-        );
-      }
-    }
   } catch (err) {
     const message = formatError(err);
     await reportAgentRuntimeStatus(sidecar, ctx, {
@@ -881,6 +1117,9 @@ async function reportAgentRuntimeStatus(
       connected,
       agentRuntimeReady: readiness.ready,
       runtimeName: AGENT_RUNTIME_NAME,
+      kind: AGENT_RUNTIME_KIND,
+      hostVersion: hostVersion(),
+      adapterVersion: adapterVersion(),
       accountId: ctx.account.accountId,
       reason: readiness.ready ? null : readiness.reason,
       lastDispatchError: readiness.ready ? null : readiness.reason,
