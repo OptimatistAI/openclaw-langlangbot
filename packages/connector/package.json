@@ -1,6 +1,6 @@
 {
   "name": "@optimatist/langlangbot-connector",
-  "version": "0.1.20-rc.3",
+  "version": "0.2.0-rc.1",
   "description": "HTTP/SSE client for the LangLangBot gateway API",
   "license": "MIT",
   "repository": {
