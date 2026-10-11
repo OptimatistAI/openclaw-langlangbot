@@ -1,5 +1,9 @@
 export {
   LanglangbotSidecar,
+  SidecarRequestError,
+  RuntimeMismatchError,
+  isRuntimeMismatch,
+  type RuntimeMismatchReason,
   type AgentStatusQuery,
   type AgentTurnPhase,
   type ApprovalAction,

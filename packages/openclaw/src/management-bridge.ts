@@ -1,4 +1,7 @@
-import type { LanglangbotSidecar } from "@optimatist/langlangbot-connector";
+import {
+  isRuntimeMismatch,
+  type LanglangbotSidecar,
+} from "@optimatist/langlangbot-connector";
 
 import {
   handleManagementRequest,
@@ -7,6 +10,7 @@ import {
 } from "./agent-runtime.js";
 import type { LanglangbotAccount } from "./config.js";
 import { formatError } from "./config.js";
+import { AGENT_RUNTIME_NAME } from "./runtime-identity.js";
 
 export function startManagementBridge(params: {
   sidecar: LanglangbotSidecar;
@@ -21,6 +25,10 @@ export function startManagementBridge(params: {
   return sidecar.subscribeManagementEvents(
     { accountId: account.accountId },
     (evt) => {
+      // Shared management bus: ignore requests targeted at another host runtime.
+      if (evt.runtime_name && evt.runtime_name !== AGENT_RUNTIME_NAME) {
+        return;
+      }
       void (async () => {
         try {
           log?.debug?.(
@@ -39,14 +47,34 @@ export function startManagementBridge(params: {
           log?.warn?.(
             `[langlangbot:${account.accountId}] management ${evt.operation} failed: ${formatError(err)}`,
           );
-          await sidecar.postManagementResult(evt.request_id, {
-            ok: false,
-            error,
-          });
+          try {
+            await sidecar.postManagementResult(evt.request_id, {
+              ok: false,
+              error,
+            });
+          } catch (postErr) {
+            log?.warn?.(
+              `[langlangbot:${account.accountId}] management result post failed: ${formatError(postErr)}`,
+            );
+          }
         }
-      })();
+      })().catch((err) => {
+        // Fire-and-forget: network/5xx on result POST must not become an
+        // unhandled rejection that takes down the OpenClaw host.
+        log?.warn?.(
+          `[langlangbot:${account.accountId}] management ${evt.operation} rejected: ${formatError(err)}`,
+        );
+      });
     },
     (err) => {
+      if (isRuntimeMismatch(err)) {
+        // Permanent: the reconnect loop already stopped. Mirror inbound's
+        // soft-idle behaviour — never escalate into the OpenClaw host.
+        log?.warn?.(
+          `[langlangbot:${account.accountId}] management SSE stopped: ${err.message}`,
+        );
+        return;
+      }
       log?.warn?.(
         `[langlangbot:${account.accountId}] management SSE error: ${err.message}`,
       );
