@@ -129,6 +129,19 @@ export type AgentStatusQuery = {
   runtimeName?: string;
 };
 
+export type ConversationTranscriptMessage = {
+  role: "user" | "assistant";
+  message_id?: string | null;
+  text: string;
+  created_at: string;
+};
+
+export type ConversationTranscript = {
+  conversation_id: string;
+  since?: string | null;
+  messages: ConversationTranscriptMessage[];
+};
+
 export type PluginConnectionCurrentResponse =
   | {
       conversation_id: string;
@@ -979,11 +992,41 @@ export class LanglangbotSidecar {
     return response.json() as Promise<PluginConnectionCurrentResponse>;
   }
 
+  async listConversationTranscript(
+    conversationId: string,
+    opts?: { limit?: number; since?: string; maxAgeHours?: number },
+  ): Promise<ConversationTranscript> {
+    const params = new URLSearchParams();
+    if (opts?.limit != null) {
+      params.set("limit", String(opts.limit));
+    }
+    if (opts?.since) {
+      params.set("since", opts.since);
+    }
+    if (opts?.maxAgeHours != null) {
+      params.set("max_age_hours", String(opts.maxAgeHours));
+    }
+    const query = params.toString();
+    const suffix = query ? `?${query}` : "";
+    const response = await this.fetchImpl(
+      `${this.baseUrl}/v1/conversations/${encodeURIComponent(conversationId)}/transcript${suffix}`,
+      {
+        method: "GET",
+        headers: this.headers(),
+      },
+    );
+    if (!response.ok) {
+      throw await sidecarRequestError("listConversationTranscript", response);
+    }
+    return (await response.json()) as ConversationTranscript;
+  }
+
   async sendMessage(
     conversationId: string,
     text: string,
     messageId?: string,
     parts?: ContentPart[],
+    proactive?: boolean,
   ): Promise<{ message_id: string }> {
     const response = await this.fetchImpl(
       `${this.baseUrl}/v1/conversations/${conversationId}/outbound/message`,
@@ -994,6 +1037,7 @@ export class LanglangbotSidecar {
           text,
           message_id: messageId,
           parts: parts ?? [],
+          ...(proactive ? { proactive: true } : {}),
         }),
       },
     );

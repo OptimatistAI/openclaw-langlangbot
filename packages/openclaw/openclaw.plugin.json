@@ -9,7 +9,8 @@
   "contracts": {
     "tools": [
       "langlangbot_connection_current",
-      "langlangbot_operator_runtime_status"
+      "langlangbot_operator_runtime_status",
+      "langlangbot_conversation_transcript"
     ]
   },
   "configSchema": {

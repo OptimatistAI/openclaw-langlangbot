@@ -51,12 +51,21 @@ import {
   createTurnLane,
   finalizeIdleTurn,
   isAgentTurnTerminalError,
+  shouldReportTurnPhase,
   shouldStartAcceptedTurn,
+  type TurnPhaseSnapshot,
 } from "./turn-control.js";
 import { buildLanglangbotSessionKey } from "./session-key.js";
 import {
+  AUTO_HISTORY_MAX_AGE_MS,
+  AUTO_HISTORY_MESSAGE_LIMIT,
+  planSessionHistoryRestore,
+  sessionFileNeedsRestore,
+} from "./session-hydrate.js";
+import {
   setOpenclawSessionStoreConfig,
   getOpenclawSessionStoreConfig,
+  loadOpenclawSessionEntry,
 } from "./session-store.js";
 
 type InboundHandle = {
@@ -307,6 +316,8 @@ export async function startLanglangbotGateway(
   const processedTerminalUploads = new Set<string>();
   /** Dedup the single batch agent turn per user message. */
   const dispatchedTerminalMessages = new Set<string>();
+  /** Last phase posted per conversation message. Survives a re-entered turn. */
+  const reportedTurnPhases = new Map<string, TurnPhaseSnapshot>();
   const enqueueInbound = createConversationInboundQueue();
   const messageKey = (conversationId: string, messageId: string) =>
     `${conversationId}:${messageId}`;
@@ -366,7 +377,13 @@ export async function startLanglangbotGateway(
         );
         return;
       }
-      await handleInbound(inbound, ctx, sidecar);
+      await handleInbound(
+        inbound,
+        ctx,
+        sidecar,
+        reportedTurnPhases,
+        messageKey(inbound.conversationId, inbound.messageId),
+      );
     }).catch((err) => {
       dispatchedTerminalMessages.delete(key);
       onInboundError(err);
@@ -639,10 +656,65 @@ export async function startLanglangbotGateway(
   });
 }
 
+/**
+ * When the OpenClaw session for this conversation has no user/assistant turns,
+ * prepend sidecar history to the inbound text. A missing file or a failed
+ * transcript read leaves the original text in place.
+ */
+async function restoreEmptySessionHistory(params: {
+  sessionKey: string;
+  conversationId: string;
+  messageId: string;
+  text: string;
+  sidecar: LanglangbotSidecar;
+  accountId: string;
+  log: ChannelGatewayContext<LanglangbotAccount>["log"];
+}): Promise<{ text: string; restoredTurns: number }> {
+  const unchanged = { text: params.text, restoredTurns: 0 };
+  if (params.text.trimStart().startsWith("/")) {
+    return unchanged;
+  }
+  const skip = (err: unknown) => {
+    params.log?.warn?.(
+      `[langlangbot:${params.accountId}] session history restore skipped: ${formatError(err)}`,
+    );
+    return unchanged;
+  };
+  let messages;
+  try {
+    const entry = await loadOpenclawSessionEntry<{ sessionFile?: unknown }>(params.sessionKey);
+    const sessionFile = typeof entry?.sessionFile === "string" ? entry.sessionFile : "";
+    if (sessionFile && !(await sessionFileNeedsRestore(sessionFile))) {
+      return unchanged;
+    }
+    messages = (
+      await params.sidecar.listConversationTranscript(params.conversationId, {
+        limit: AUTO_HISTORY_MESSAGE_LIMIT,
+        maxAgeHours: AUTO_HISTORY_MAX_AGE_MS / 3_600_000,
+      })
+    ).messages;
+  } catch (err) {
+    return skip(err);
+  }
+  const planned = planSessionHistoryRestore({
+    turns: messages,
+    currentMessageId: params.messageId,
+    currentText: params.text,
+  });
+  if (planned.restoredTurns > 0) {
+    params.log?.info?.(
+      `[langlangbot:${params.accountId}] restored ${planned.restoredTurns} transcript turns into empty session ${params.sessionKey}`,
+    );
+  }
+  return planned;
+}
+
 async function handleInbound(
   inbound: InboundHandle,
   ctx: ChannelGatewayContext<LanglangbotAccount>,
   sidecar: LanglangbotSidecar,
+  reportedTurnPhases: Map<string, TurnPhaseSnapshot>,
+  phaseKey: string,
 ): Promise<void> {
   const account = ctx.account;
   const turnTiming = {
@@ -650,8 +722,31 @@ async function handleInbound(
     firstOutboundLogged: false,
   };
   const timingElapsedMs = () => Math.round(performance.now() - turnTiming.t0);
-  // Once failed, ignore a later onIdle so durable failed is not overwritten.
-  let turnFailed = false;
+  const commitTurnPhase = (
+    phase: AgentTurnPhase,
+    detail?: string,
+  ): boolean => {
+    const next = { phase, detail };
+    if (!shouldReportTurnPhase(reportedTurnPhases.get(phaseKey), next)) {
+      return false;
+    }
+    reportedTurnPhases.set(phaseKey, next);
+    return true;
+  };
+  const restoreCommittedPhase = (
+    phase: AgentTurnPhase,
+    previous: TurnPhaseSnapshot | undefined,
+  ) => {
+    const current = reportedTurnPhases.get(phaseKey);
+    if (current?.phase !== phase) {
+      return;
+    }
+    if (previous) {
+      reportedTurnPhases.set(phaseKey, previous);
+    } else {
+      reportedTurnPhases.delete(phaseKey);
+    }
+  };
   const reportPhase = (
     phase: AgentTurnPhase,
     detail?: string,
@@ -664,9 +759,8 @@ async function handleInbound(
       );
       return;
     }
-    if (phase === "failed") {
-      turnFailed = true;
-    } else if (phase === "idle" && turnFailed) {
+    const previous = reportedTurnPhases.get(phaseKey);
+    if (!commitTurnPhase(phase, detail)) {
       return;
     }
     void sidecar
@@ -677,6 +771,9 @@ async function handleInbound(
         detail,
       )
       .catch((err: unknown) => {
+        if (!isAgentTurnTerminalError(err)) {
+          restoreCommittedPhase(phase, previous);
+        }
         ctx.log?.debug?.(
           `[langlangbot:${account.accountId}] reportTurnPhase ${phase} failed: ${
             formatError(err)
@@ -751,10 +848,19 @@ async function handleInbound(
     const storePath = runtime.session.resolveStorePath(getOpenclawSessionStoreConfig(), {
       agentId: account.agentId,
     });
-    const body = formatInboundBody({
+    const restored = await restoreEmptySessionHistory({
+      sessionKey,
       conversationId: inbound.conversationId,
       messageId: inbound.messageId,
       text: inbound.text,
+      sidecar,
+      log: ctx.log,
+      accountId: account.accountId,
+    });
+    const body = formatInboundBody({
+      conversationId: inbound.conversationId,
+      messageId: inbound.messageId,
+      text: restored.text,
       parts: inbound.parts,
       receivedAt: new Date().toISOString(),
       ownerSurfaceId: inbound.ownerSurfaceId,
@@ -763,7 +869,10 @@ async function handleInbound(
       Body: body,
       RawBody: body,
       BodyForAgent: body,
-      CommandBody: inbound.text,
+      // OpenClaw stores CommandBody in the session transcript. When we restored
+      // history, keep that block in the stored user turn so the next message
+      // still sees it. Slash commands skip restore and stay on the raw text.
+      CommandBody: restored.restoredTurns > 0 ? body : inbound.text,
       From: from,
       To: to,
       SessionKey: sessionKey,
@@ -779,7 +888,6 @@ async function handleInbound(
     const streamState = {
       streamedText: "",
       sentFinal: false,
-      reportedIdle: false,
       pendingMedia: [] as string[],
       sentMedia: new Set<string>(),
     };
@@ -938,19 +1046,29 @@ async function handleInbound(
                     }
                   },
                   reportIdle: async () => {
-                    if (streamState.reportedIdle || turnFailed) {
-                      return;
-                    }
                     if (typeof sidecar.reportTurnPhase !== "function") {
                       reportPhase("idle");
                       return;
                     }
-                    streamState.reportedIdle = true;
-                    await sidecar.reportTurnPhase(
-                      inbound.conversationId,
-                      inbound.messageId,
-                      "idle",
-                    );
+                    const previous = reportedTurnPhases.get(phaseKey);
+                    if (!commitTurnPhase("idle")) {
+                      return;
+                    }
+                    try {
+                      await sidecar.reportTurnPhase(
+                        inbound.conversationId,
+                        inbound.messageId,
+                        "idle",
+                      );
+                    } catch (err) {
+                      // 409 means the sidecar already closed the turn. Any other
+                      // failure leaves the ledger where it was so `failed` can
+                      // still be reported.
+                      if (!isAgentTurnTerminalError(err)) {
+                        restoreCommittedPhase("idle", previous);
+                      }
+                      throw err;
+                    }
                   },
                   onRealFailure: (err) => {
                     ctx.log?.error?.(
@@ -1139,7 +1257,7 @@ async function sendOperatorVisibleStatus(
   text: string,
 ): Promise<void> {
   try {
-    await sidecar.sendMessage(conversationId, text);
+    await sidecar.sendMessage(conversationId, text, undefined, undefined, true);
   } catch {
     // The caller still logs the dispatch failure. Avoid hiding the original cause.
   }

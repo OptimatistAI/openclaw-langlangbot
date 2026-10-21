@@ -68,6 +68,16 @@ When the Operator asks about context usage, context window size, current model, 
 
 OpenClaw's `session_status` may show a 200k fallback denominator and different token totals; this plugin tool reads the same session-store projection as the Operator app bar (`GET /v1/conversations/{id}/agent/status`).
 
+## Earlier Operator chat
+
+An empty OpenClaw session is seeded with only the last 30 minutes of this conversation (silent, capped). That is not the full archive.
+
+When the user asks about an earlier topic, or the seed is not enough:
+
+1. Call **`langlangbot_conversation_transcript`**.
+2. Pass `since` (RFC3339) or `max_age_hours` (default 24, maximum 168). Do not request routine turns.
+3. Answer from the returned `messages` for this conversation only.
+
 ## Operator reminders (cron)
 
 LangLangBot supports two scheduling paths. Pick whichever matches the agent's available tools.
