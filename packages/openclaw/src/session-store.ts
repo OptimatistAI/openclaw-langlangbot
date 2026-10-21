@@ -29,19 +29,26 @@ export function setOpenclawSessionStoreConfig(store: unknown): void {
   openclawSessionStoreConfig = store;
 }
 
-export async function readJsonFile<T>(path: string): Promise<T | null> {
+export async function readTextFile(path: string): Promise<string | null> {
   try {
-    const raw = await readFile(path, "utf8");
-    try {
-      return JSON.parse(raw) as T;
-    } catch (err) {
-      throw new Error(`invalid JSON in ${path}: ${formatError(err)}`);
-    }
+    return await readFile(path, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       return null;
     }
     throw err;
+  }
+}
+
+export async function readJsonFile<T>(path: string): Promise<T | null> {
+  const raw = await readTextFile(path);
+  if (raw == null) {
+    return null;
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch (err) {
+    throw new Error(`invalid JSON in ${path}: ${formatError(err)}`);
   }
 }
 

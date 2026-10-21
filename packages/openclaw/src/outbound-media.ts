@@ -186,6 +186,7 @@ export async function sendOutboundFiles(
   accountId: string,
   localPaths: string[],
   caption?: string,
+  proactive = false,
 ): Promise<{ messageId: string; files: StagedOutboundFile[] }> {
   const staged: StagedOutboundFile[] = [];
   for (const localPath of localPaths) {
@@ -198,6 +199,7 @@ export async function sendOutboundFiles(
     resolveCaption(caption, localPaths),
     undefined,
     staged.map((file) => file.part),
+    proactive,
   );
   return { messageId: sent.message_id, files: staged };
 }

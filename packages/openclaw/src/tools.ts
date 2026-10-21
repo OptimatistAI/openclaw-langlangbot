@@ -1,5 +1,5 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
-import { jsonResult, readStringParam } from "openclaw/plugin-sdk/core";
+import { jsonResult, readNumberParam, readStringParam } from "openclaw/plugin-sdk/core";
 
 import {
   formatOperatorRuntimeStatusForAgent,
@@ -130,4 +130,90 @@ export function registerLanglangbotTools(api: OpenClawPluginApi): void {
     },
     { names: ["langlangbot_operator_runtime_status"] },
   );
+
+  api.registerTool(
+    (ctx) => {
+      const runtime = resolveLanglangbotToolContext(ctx);
+      if (!runtime) {
+        return null;
+      }
+      const { sidecar } = runtime;
+      return {
+        name: "langlangbot_conversation_transcript",
+        label: "LangLangBot conversation transcript",
+        description:
+          "Read earlier Operator chat for this conversation from LangLangBot. " +
+          "Use when the user asks about topics older than the recent continuity seed, " +
+          "or when the restored context is not enough. Do not call this for routine turns. " +
+          "Pass since (RFC3339) or max_age_hours (default 24, max 168).",
+        parameters: transcriptParameters,
+        async execute(_toolCallId, params) {
+          const conversationId = resolveConversationId(ctx, params);
+          if (!conversationId) {
+            return jsonResult({
+              status: "error",
+              message:
+                "conversation_id is required when no active langlangbot session is available.",
+            });
+          }
+          const since = readStringParam(params, "since") || undefined;
+          const limit = clampTranscriptLimit(readNumberParam(params, "limit", { integer: true }));
+          try {
+            const body = await sidecar.listConversationTranscript(conversationId, {
+              limit,
+              since,
+              maxAgeHours: since
+                ? undefined
+                : clampTranscriptHours(readNumberParam(params, "max_age_hours")),
+            });
+            return jsonResult(body);
+          } catch (err) {
+            return jsonResult({
+              status: "error",
+              message: err instanceof Error ? err.message : String(err),
+            });
+          }
+        },
+      };
+    },
+    { names: ["langlangbot_conversation_transcript"] },
+  );
+}
+
+const transcriptParameters = {
+  type: "object",
+  properties: {
+    ...conversationIdParameters.properties,
+    since: {
+      type: "string",
+      description: "RFC3339 inclusive lower bound. Wins over max_age_hours.",
+    },
+    max_age_hours: {
+      type: "number",
+      description: "Hours ending now when since is omitted. Default 24, maximum 168.",
+    },
+    limit: {
+      type: "number",
+      description: "Maximum turns to return. Default 40, maximum 80.",
+    },
+  },
+} as const;
+
+const TRANSCRIPT_DEFAULT_HOURS = 24;
+const TRANSCRIPT_MAX_HOURS = 168;
+const TRANSCRIPT_DEFAULT_LIMIT = 40;
+const TRANSCRIPT_MAX_LIMIT = 80;
+
+function clampTranscriptHours(raw: number | undefined): number {
+  if (raw == null) {
+    return TRANSCRIPT_DEFAULT_HOURS;
+  }
+  return Math.min(TRANSCRIPT_MAX_HOURS, Math.max(1, raw));
+}
+
+function clampTranscriptLimit(raw: number | undefined): number {
+  if (raw == null) {
+    return TRANSCRIPT_DEFAULT_LIMIT;
+  }
+  return Math.min(TRANSCRIPT_MAX_LIMIT, Math.max(1, Math.floor(raw)));
 }

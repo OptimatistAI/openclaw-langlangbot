@@ -15,6 +15,8 @@ export {
   OpenClawApprovalKind,
   isOpenClawApprovalKind,
   normalizeApprovalKind,
+  type ConversationTranscript,
+  type ConversationTranscriptMessage,
   type HealthStatus,
   type InboundHandler,
   type InboundMessage,

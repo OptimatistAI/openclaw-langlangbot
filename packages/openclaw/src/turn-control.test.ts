@@ -6,6 +6,7 @@ import {
   createTurnLane,
   finalizeIdleTurn,
   isAgentTurnTerminalError,
+  shouldReportTurnPhase,
   shouldStartAcceptedTurn,
 } from "./turn-control.ts";
 
@@ -108,6 +109,48 @@ test("structured 409 is idempotent and other failures stay real", async () => {
   assert.deepEqual(idle, []);
   assert.deepEqual(duplicates, ["409"]);
   assert.deepEqual(failures, ["real"]);
+});
+
+test("turn phase posts once, then stays quiet after idle or failed", () => {
+  assert.equal(shouldReportTurnPhase(undefined, { phase: "working" }), true);
+  assert.equal(
+    shouldReportTurnPhase({ phase: "working" }, { phase: "working" }),
+    false,
+  );
+  assert.equal(
+    shouldReportTurnPhase(
+      { phase: "working", detail: "  " },
+      { phase: "working" },
+    ),
+    false,
+  );
+  assert.equal(
+    shouldReportTurnPhase(
+      { phase: "tool", detail: "read" },
+      { phase: "tool", detail: "write" },
+    ),
+    true,
+  );
+  assert.equal(
+    shouldReportTurnPhase({ phase: "working" }, { phase: "failed", detail: "boom" }),
+    true,
+  );
+  assert.equal(
+    shouldReportTurnPhase({ phase: "working" }, { phase: "idle" }),
+    true,
+  );
+  for (const phase of ["working", "tool", "thinking", "streaming", "idle", "failed"]) {
+    assert.equal(
+      shouldReportTurnPhase({ phase: "idle" }, { phase }),
+      false,
+      `idle blocks ${phase}`,
+    );
+    assert.equal(
+      shouldReportTurnPhase({ phase: "failed", detail: "boom" }, { phase }),
+      false,
+      `failed blocks ${phase}`,
+    );
+  }
 });
 
 test("only the first accept starts a turn", () => {

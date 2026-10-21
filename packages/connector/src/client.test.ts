@@ -230,6 +230,41 @@ test("postManagementResult treats 404 request_not_found as already expired", asy
   await sidecar.postManagementResult("req-1", { ok: true, result: {} });
 });
 
+test("listConversationTranscript requests plugin-token history", async () => {
+  let url = "";
+  let headers: Record<string, string> = {};
+  const sidecar = new LanglangbotSidecar(
+    baseOpts({
+      pluginToken: "plugin-secret",
+      runtimeKind: "openclaw",
+      fetchImpl: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        url = String(input);
+        headers = Object.fromEntries(new Headers(init?.headers).entries());
+        return new Response(
+          JSON.stringify({
+            conversation_id: "c9c3516f-532b-4706-b79c-d23c4b816514",
+            messages: [],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch,
+      allowInsecureHttp: true,
+    }),
+  );
+  const body = await sidecar.listConversationTranscript(
+    "c9c3516f-532b-4706-b79c-d23c4b816514",
+    { limit: 40, maxAgeHours: 0.5, since: "2026-10-20T00:00:00Z" },
+  );
+  assert.equal(body.messages.length, 0);
+  const parsed = new URL(url);
+  assert.equal(parsed.pathname, "/v1/conversations/c9c3516f-532b-4706-b79c-d23c4b816514/transcript");
+  assert.equal(parsed.searchParams.get("limit"), "40");
+  assert.equal(parsed.searchParams.get("max_age_hours"), "0.5");
+  assert.equal(parsed.searchParams.get("since"), "2026-10-20T00:00:00Z");
+  assert.equal(headers["x-langlangbot-plugin-token"], "plugin-secret");
+  assert.equal(headers["x-langlangbot-runtime-kind"], "openclaw");
+});
+
 test("postManagementResult still throws on 500 and bare 404", async () => {
   const boom = new LanglangbotSidecar(
     baseOpts({
@@ -260,4 +295,23 @@ test("postManagementResult still throws on 500 and bare 404", async () => {
       return true;
     },
   );
+});
+
+test("sendMessage writes proactive only for an out-of-turn delivery", async () => {
+  const bodies: Array<Record<string, unknown>> = [];
+  const sidecar = new LanglangbotSidecar(
+    baseOpts({
+      fetchImpl: (async (_input: RequestInfo | URL, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+        return new Response(JSON.stringify({ message_id: "m1" }), { status: 200 });
+      }) as unknown as typeof fetch,
+      allowInsecureHttp: true,
+    }),
+  );
+  await sidecar.sendMessage("c1", "turn reply");
+  await sidecar.sendMessage("c1", "reminder", undefined, undefined, true);
+  assert.equal(bodies[0]?.proactive, undefined);
+  assert.equal(bodies[0]?.text, "turn reply");
+  assert.equal(bodies[1]?.proactive, true);
+  assert.equal(bodies[1]?.text, "reminder");
 });

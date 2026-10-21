@@ -84,7 +84,13 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
         throw new Error(`langlangbot: invalid target ${to}`);
       }
       const sidecar = createLanglangbotSidecar(account);
-      const result = await sidecar.sendMessage(conversationId, text ?? "");
+      const result = await sidecar.sendMessage(
+        conversationId,
+        text ?? "",
+        undefined,
+        undefined,
+        true,
+      );
       return {
         channel: "langlangbot",
         messageId: result.message_id,
@@ -110,6 +116,7 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
         // The tool's own text, if any. No fallback caption: the filename
         // already travels on the attachment part.
         text?.trim() || undefined,
+        true,
       );
       return {
         channel: "langlangbot",

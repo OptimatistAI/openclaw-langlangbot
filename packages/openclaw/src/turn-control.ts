@@ -1,3 +1,5 @@
+import type { AgentTurnPhase } from "@optimatist/langlangbot-connector";
+
 /** Serialize outbound work for one turn so idle cannot pass an in-flight send. */
 export function createTurnLane(): <T>(task: () => Promise<T>) => Promise<T> {
   let tail: Promise<unknown> = Promise.resolve();
@@ -23,6 +25,42 @@ export function createSingleFlight(
     );
     return pending;
   };
+}
+
+export type TurnPhaseSnapshot = {
+  phase: AgentTurnPhase;
+  detail?: string;
+};
+
+function phaseDetail(detail?: string): string | undefined {
+  if (detail == null) {
+    return undefined;
+  }
+  const trimmed = detail.trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/**
+ * Whether this phase should be POSTed for a message.
+ * A message that already reached `idle` or `failed` stays quiet.
+ * An unchanged phase and detail is not posted again.
+ * `failed` still reports over a non-terminal phase.
+ */
+export function shouldReportTurnPhase(
+  previous: TurnPhaseSnapshot | undefined,
+  next: TurnPhaseSnapshot,
+): boolean {
+  if (previous?.phase === "idle" || previous?.phase === "failed") {
+    return false;
+  }
+  if (
+    previous &&
+    previous.phase === next.phase &&
+    phaseDetail(previous.detail) === phaseDetail(next.detail)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export function isAgentTurnTerminalError(err: unknown): boolean {
