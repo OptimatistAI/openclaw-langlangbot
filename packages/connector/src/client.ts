@@ -197,6 +197,12 @@ export type InboundSubscriptionParams = {
 };
 
 export type InboundHandler = {
+  /**
+   * Fired once each time the stream recovers from a failed connect attempt,
+   * e.g. after a sidecar restart. A first-time connect does not fire it (the
+   * gateway reports status before subscribing), and neither does a clean EOF.
+   */
+  onReconnect?: () => void | Promise<void>;
   onMessage?: (evt: InboundMessage) => void;
   onAttachmentAvailable?: (evt: InboundAttachmentAvailable) => void;
   onAttachmentReady?: (evt: InboundAttachmentReady) => void;
@@ -207,7 +213,8 @@ function isInboundHandler(value: unknown): value is InboundHandler {
   return (
     !!value &&
     typeof value === "object" &&
-    ("onMessage" in value ||
+    ("onReconnect" in value ||
+      "onMessage" in value ||
       "onAttachmentAvailable" in value ||
       "onAttachmentReady" in value ||
       "onAttachmentFailed" in value)
@@ -443,6 +450,7 @@ async function parseRuntimeMismatch(
 function startReconnectingSse(params: {
   connect: (signal: AbortSignal, lastEventId?: string) => Promise<Response>;
   onData: (data: string, eventId?: string) => void;
+  onReconnect?: () => void | Promise<void>;
   onError?: (err: Error) => void;
   errorLabel: string;
 }): Unsubscribe {
@@ -462,7 +470,17 @@ function startReconnectingSse(params: {
           }
           throw new Error(`${params.errorLabel}: ${response.status}`);
         }
+        const reconnected = attempt > 0;
         attempt = 0;
+        if (reconnected) {
+          // A bookkeeping hook must not tear down the stream it just opened:
+          // swallow both a synchronous throw and a rejected promise.
+          try {
+            void Promise.resolve(params.onReconnect?.()).catch(() => {});
+          } catch {
+            // Swallowed as above.
+          }
+        }
         await consumeSse(
           response,
           (_eventName, data, eventId) => {
@@ -668,6 +686,7 @@ export class LanglangbotSidecar {
     const suffix = inboundQuerySuffix(params);
     return startReconnectingSse({
       errorLabel: "inbound SSE failed",
+      onReconnect: callbacks.onReconnect,
       onError: errorHandler,
       connect: (signal, lastEventId) =>
         this.fetchImpl(`${this.baseUrl}/v1/inbound/events${suffix}`, {
