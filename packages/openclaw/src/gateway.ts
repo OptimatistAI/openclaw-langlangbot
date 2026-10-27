@@ -57,6 +57,17 @@ import {
 } from "./turn-control.js";
 import { buildLanglangbotSessionKey } from "./session-key.js";
 import {
+  appendStreamedBlock,
+  blockSeparator,
+  isMarkdownSafeTail,
+} from "./stream-text.js";
+
+/**
+ * Stop holding a half-written delta once it grows past this: a long fenced
+ * block or table should still stream instead of appearing all at once.
+ */
+const DELTA_HOLD_MAX_CHARS = 600;
+import {
   AUTO_HISTORY_MAX_AGE_MS,
   AUTO_HISTORY_MESSAGE_LIMIT,
   planSessionHistoryRestore,
@@ -280,6 +291,10 @@ export async function startLanglangbotGateway(
   }
 
   const sidecar = createLanglangbotSidecar(account);
+  // The sidecar replaces the whole status record on every PUT, so keep the
+  // last dispatch failure here until a turn succeeds; otherwise an unrelated
+  // SSE reconnect would erase it without any successful turn.
+  const dispatchState: { lastError: string | null } = { lastError: null };
 
   ctx.log?.info?.(
     `[langlangbot:${account.accountId}] connected to LangLangBot at ${account.sidecarUrl}${
@@ -383,6 +398,7 @@ export async function startLanglangbotGateway(
         sidecar,
         reportedTurnPhases,
         messageKey(inbound.conversationId, inbound.messageId),
+        dispatchState,
       );
     }).catch((err) => {
       dispatchedTerminalMessages.delete(key);
@@ -516,6 +532,13 @@ export async function startLanglangbotGateway(
   const unsubscribe = sidecar.subscribeInbound(
     { accountId: account.accountId, agentSurfaceId: account.surfaceId },
     {
+      // The sidecar keeps runtime status in process memory. startChannelGateway
+      // reports it once, but a sidecar restart (upgrade, crash recovery) only
+      // reconnects this SSE loop, so re-report here or Operator keeps showing
+      // the runtime as offline while chat works.
+      onReconnect: () => {
+        reportRuntimeStatusAfterReconnect();
+      },
       onMessage: (evt) => {
         if (pendingAttachmentParts(evt.parts)) {
           const key = messageKey(evt.conversationId, evt.messageId);
@@ -613,15 +636,41 @@ export async function startLanglangbotGateway(
   );
 
   function onInboundError(err: unknown): void {
+    dispatchState.lastError = formatError(err);
     void reportAgentRuntimeStatus(sidecar, ctx, {
       ready: false,
-      reason: formatError(err),
+      reason: dispatchState.lastError,
     });
     ctx.log?.error?.(
       `[langlangbot:${account.accountId}] inbound dispatch failed: ${
         formatError(err)
       }`,
     );
+  }
+
+  function reportRuntimeStatusAfterReconnect(): void {
+    void (async () => {
+      // The reconnect can beat the sidecar's readiness. Retry once so a
+      // transient PUT failure does not leave Operator offline until the next
+      // inbound turn.
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        if (ctx.abortSignal.aborted) {
+          return;
+        }
+        const readiness = runtimeReadiness(ctx);
+        const reported = await reportAgentRuntimeStatus(
+          sidecar,
+          ctx,
+          readiness,
+          true,
+          readiness.ready ? dispatchState.lastError : readiness.reason,
+        );
+        if (reported) {
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+    })();
   }
 
   ctx.setStatus({
@@ -715,6 +764,7 @@ async function handleInbound(
   sidecar: LanglangbotSidecar,
   reportedTurnPhases: Map<string, TurnPhaseSnapshot>,
   phaseKey: string,
+  dispatchState: { lastError: string | null },
 ): Promise<void> {
   const account = ctx.account;
   const turnTiming = {
@@ -815,6 +865,7 @@ async function handleInbound(
 
   const readiness = runtimeReadiness(ctx);
   if (!readiness.ready) {
+    dispatchState.lastError = readiness.reason;
     await reportAgentRuntimeStatus(sidecar, ctx, readiness);
     reportPhase("failed", readiness.reason);
     await sendOperatorVisibleStatus(
@@ -887,6 +938,10 @@ async function handleInbound(
     });
     const streamState = {
       streamedText: "",
+      // Text already accepted from OpenClaw but not yet shown to the client:
+      // holding it back keeps a table, list or fenced block from rendering
+      // half-written while the rest of it is still on the way.
+      pendingDelta: "",
       sentFinal: false,
       pendingMedia: [] as string[],
       sentMedia: new Set<string>(),
@@ -1016,6 +1071,17 @@ async function handleInbound(
               lane(() =>
                 finalizeIdleTurn({
                   sendFinal: async () => {
+                    if (streamState.pendingDelta) {
+                      const chunk = streamState.pendingDelta;
+                      streamState.pendingDelta = "";
+                      ctx.log?.debug?.(
+                        `[langlangbot:${account.accountId}] outbound delta (final, ${chunk.length} chars) → ${inbound.conversationId}`,
+                      );
+                      markOutboundFirst(null);
+                      await sidecar
+                        .sendDelta(inbound.conversationId, chunk)
+                        .catch(() => undefined);
+                    }
                     if (
                       account.streaming &&
                       streamState.streamedText &&
@@ -1150,12 +1216,41 @@ async function handleInbound(
                     return;
                   }
                   if (account.streaming && kind === "block") {
-                    streamState.streamedText = text;
+                    // A reply can arrive as several blocks; keep them all.
+                    // Overwriting here dropped every earlier block from the
+                    // message onIdle finally delivers.
+                    const separator = blockSeparator(
+                      streamState.streamedText,
+                      text,
+                    );
+                    ctx.log?.info?.(
+                      `[langlangbot:${account.accountId}] stream block ${text.length} chars sep=${JSON.stringify(separator)} prevTail=${JSON.stringify(streamState.streamedText.slice(-14))} → ${inbound.conversationId}`,
+                    );
+                    streamState.streamedText = appendStreamedBlock(
+                      streamState.streamedText,
+                      text,
+                    );
+                    streamState.pendingDelta = appendStreamedBlock(
+                      streamState.pendingDelta,
+                      text,
+                    );
+                    const ready =
+                      isMarkdownSafeTail(streamState.pendingDelta) ||
+                      streamState.pendingDelta.length >= DELTA_HOLD_MAX_CHARS;
+                    if (!ready) {
+                      ctx.log?.debug?.(
+                        `[langlangbot:${account.accountId}] outbound delta held (${streamState.pendingDelta.length} chars) → ${inbound.conversationId}`,
+                      );
+                      markOutboundFirst(null);
+                      return;
+                    }
+                    const chunk = streamState.pendingDelta;
+                    streamState.pendingDelta = "";
                     ctx.log?.debug?.(
-                      `[langlangbot:${account.accountId}] outbound delta (${text.length} chars) → ${inbound.conversationId}`,
+                      `[langlangbot:${account.accountId}] outbound delta (${chunk.length} chars) → ${inbound.conversationId}`,
                     );
                     markOutboundFirst(null);
-                    await sidecar.sendDelta(inbound.conversationId, text);
+                    await sidecar.sendDelta(inbound.conversationId, chunk);
                     return;
                   }
                   // OpenClaw often emits only a final payload (no block chunks). The Operator
@@ -1207,9 +1302,11 @@ async function handleInbound(
         }),
       },
     });
+    dispatchState.lastError = null;
     await reportAgentRuntimeStatus(sidecar, ctx, readiness);
   } catch (err) {
     const message = formatError(err);
+    dispatchState.lastError = message;
     await reportAgentRuntimeStatus(sidecar, ctx, {
       ready: false,
       reason: message,
@@ -1229,7 +1326,8 @@ async function reportAgentRuntimeStatus(
   ctx: ChannelGatewayContext<LanglangbotAccount>,
   readiness: RuntimeReadiness,
   connected = true,
-): Promise<void> {
+  lastDispatchError: string | null = readiness.ready ? null : readiness.reason,
+): Promise<boolean> {
   try {
     await sidecar.updateAgentRuntimeStatus({
       connected,
@@ -1240,14 +1338,16 @@ async function reportAgentRuntimeStatus(
       adapterVersion: adapterVersion(),
       accountId: ctx.account.accountId,
       reason: readiness.ready ? null : readiness.reason,
-      lastDispatchError: readiness.ready ? null : readiness.reason,
+      lastDispatchError,
     });
+    return true;
   } catch (err) {
     ctx.log?.warn?.(
       `[langlangbot:${ctx.account.accountId}] agent runtime status update failed: ${
         formatError(err)
       }`,
     );
+    return false;
   }
 }
 

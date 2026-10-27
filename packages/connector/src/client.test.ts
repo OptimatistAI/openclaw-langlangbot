@@ -155,6 +155,82 @@ test("SSE 500 keeps the transient retry behavior", async () => {
   assert.ok(calls.count >= 2, `expected retries, got ${calls.count} attempts`);
 });
 
+test(
+  "onReconnect fires once after the SSE stream recovers",
+  { timeout: 5_000 },
+  async () => {
+    const calls = { count: 0 };
+    const sidecar = new LanglangbotSidecar(
+      baseOpts({
+        runtimeKind: "openclaw",
+        // First connect fails, second succeeds and ends immediately. The hook
+        // must fire for the recovered connection only.
+        fetchImpl: sseFetch(
+          () =>
+            calls.count === 1
+              ? new Response("boom", { status: 500 })
+              : new Response("", {
+                  status: 200,
+                  headers: { "content-type": "text/event-stream" },
+                }),
+          calls,
+        ),
+        allowInsecureHttp: true,
+      }),
+    );
+
+    let unsub!: () => void;
+    const recovered = new Promise<number>((resolve) => {
+      unsub = sidecar.subscribeInbound({
+        onReconnect: () => resolve(calls.count),
+      });
+    });
+
+    assert.equal(await recovered, 2);
+    unsub();
+  },
+);
+
+test(
+  "a rejecting async onReconnect does not break the stream",
+  { timeout: 5_000 },
+  async () => {
+    const calls = { count: 0 };
+    const payload = JSON.stringify({
+      conversation_id: "c1",
+      message_id: "m1",
+      text: "hello",
+      received_at: new Date().toISOString(),
+    });
+    const sidecar = new LanglangbotSidecar(
+      baseOpts({
+        runtimeKind: "openclaw",
+        fetchImpl: sseFetch(
+          () =>
+            calls.count === 1
+              ? new Response("boom", { status: 500 })
+              : new Response(`data: ${payload}\n\n`, {
+                  status: 200,
+                  headers: { "content-type": "text/event-stream" },
+                }),
+          calls,
+        ),
+        allowInsecureHttp: true,
+      }),
+    );
+
+    let unsub!: () => void;
+    const received = new Promise<string>((resolve) => {
+      unsub = sidecar.subscribeInbound({
+        onReconnect: () => Promise.reject(new Error("hook failed")),
+        onMessage: (evt) => resolve(evt.text),
+      });
+    });
+
+    assert.equal(await received, "hello");
+    unsub();
+  },
+);
 
 test("SSE 409 runtime_instance_mismatch terminates like kind mismatch", async () => {
   const calls = { count: 0 };

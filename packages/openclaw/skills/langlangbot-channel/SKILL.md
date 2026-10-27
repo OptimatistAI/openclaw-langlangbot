@@ -68,6 +68,15 @@ When the Operator asks about context usage, context window size, current model, 
 
 OpenClaw's `session_status` may show a 200k fallback denominator and different token totals; this plugin tool reads the same session-store projection as the Operator app bar (`GET /v1/conversations/{id}/agent/status`).
 
+## What reaches Operator (reply surface)
+
+Only the **assistant reply text** is rendered in the chat. Tool results, tool cards, reasoning and internal notes stay inside the Agent host: the Operator app never sees them.
+
+- **Restate what the user asked for.** If the user wants command output, a file listing, or a diff, paste it into the reply (fenced, with a language tag). Never answer "see the tool output above" — there is nothing above for the Operator.
+- **Markdown renders natively**: headings, bullet/numbered lists, nested and task lists, tables, blockquotes, inline and fenced code, bold/italic/strikethrough, `[links](url)`. Prefer real structure — a pipe table over space-aligned columns, a fenced block over a wall of `ls` text.
+- **Never answer `NO_REPLY` to an explicit user request.** That token is for genuinely silent turns (nothing to say), not for skipping work.
+- Replies stream in blocks; keep a table or code fence inside one coherent stretch of text rather than spanning thousands of characters.
+
 ## Earlier Operator chat
 
 An empty OpenClaw session is seeded with only the last 30 minutes of this conversation (silent, capped). That is not the full archive.

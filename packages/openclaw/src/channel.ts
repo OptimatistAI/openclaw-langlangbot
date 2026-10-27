@@ -1,5 +1,10 @@
 import type { ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
+  MARKDOWN_CAPABLE,
+  MARKDOWN_TABLE_MODE,
+  OPERATOR_FORMATTING_HINTS,
+} from "./channel-capabilities.js";
+import {
   createLanglangbotSidecar,
   parseConversationTarget,
   resolveLanglangbotAccount,
@@ -25,6 +30,10 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
     docsLabel: "langlangbot",
     blurb: "Connect OpenClaw to LangLangBot for Operator chat, streaming replies, and exec/plugin approvals.",
     systemImage: "message.fill",
+    // Operator renders GitHub-flavoured markdown natively (tables, fenced code,
+    // nested lists, blockquotes, links), so OpenClaw should keep markdown in
+    // tool results and outbound formatting decisions instead of flattening it.
+    markdownCapable: MARKDOWN_CAPABLE,
   },
   capabilities: {
     chatTypes: ["direct"],
@@ -130,6 +139,9 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
     },
   },
   messaging: {
+    // Tables survive to the client as markdown tables; never downgrade them to
+    // bullets or code blocks for this channel.
+    defaultMarkdownTableMode: MARKDOWN_TABLE_MODE,
     normalizeTarget: (raw) => raw.trim(),
     targetResolver: {
       looksLikeId: looksLikeLanglangbotDeliveryTarget,
@@ -138,14 +150,12 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
     resolveOutboundSessionRoute: resolveLanglangbotOutboundSessionRoute,
   },
   agentPrompt: {
-    messageToolHints: () => [
-      "LangLangBot delivery target is conversation:<uuid> from the active session key.",
-      "Operator chat sets OwnerAllowFrom from ODA-attested owner_surface_id; cron tool is usually available without commands.ownerAllowFrom.",
-      "For Operator reminders via cron: payload.kind agentTurn, sessionTarget isolated, delivery { mode: announce } only (never channel without to). See langlangbot-channel skill.",
-      "For Operator context/model questions (app runtime bar), call langlangbot_operator_runtime_status instead of session_status.",
-      "Operator only renders your reply text; tool results and reasoning never reach the app. Restate any tool output the user asked for, and never answer NO_REPLY to an explicit user request.",
-      "Pending inbound attachments: acknowledge intent, wait for attachment_ready before analyzing file contents.",
-      `Outbound files must be written to ${outboundExportDir()}/ (create it if missing) before sending to Operator.`,
-    ],
+    // The only channel hook OpenClaw renders on every inbound message: it lands
+    // in the trusted-metadata block as response_format. The other hook,
+    // messageToolHints, is only read when the `message` tool exists, which this
+    // direct channel does not get outside message-tool delivery modes, so the
+    // delivery/cron/attachment guidance lives in the langlangbot-channel skill
+    // instead of in dead prompt code.
+    inboundFormattingHints: () => OPERATOR_FORMATTING_HINTS,
   },
 };
