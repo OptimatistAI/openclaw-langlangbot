@@ -1,5 +1,10 @@
 import type { ChannelPlugin } from "openclaw/plugin-sdk/channel-core";
 import {
+  MARKDOWN_CAPABLE,
+  MARKDOWN_TABLE_MODE,
+  OPERATOR_FORMATTING_HINTS,
+} from "./channel-capabilities.js";
+import {
   createLanglangbotSidecar,
   parseConversationTarget,
   resolveLanglangbotAccount,
@@ -25,6 +30,10 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
     docsLabel: "langlangbot",
     blurb: "Connect OpenClaw to LangLangBot for Operator chat, streaming replies, and exec/plugin approvals.",
     systemImage: "message.fill",
+    // Operator renders GitHub-flavoured markdown natively (tables, fenced code,
+    // nested lists, blockquotes, links), so OpenClaw should keep markdown in
+    // tool results and outbound formatting decisions instead of flattening it.
+    markdownCapable: MARKDOWN_CAPABLE,
   },
   capabilities: {
     chatTypes: ["direct"],
@@ -130,6 +139,9 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
     },
   },
   messaging: {
+    // Tables survive to the client as markdown tables; never downgrade them to
+    // bullets or code blocks for this channel.
+    defaultMarkdownTableMode: MARKDOWN_TABLE_MODE,
     normalizeTarget: (raw) => raw.trim(),
     targetResolver: {
       looksLikeId: looksLikeLanglangbotDeliveryTarget,
@@ -138,6 +150,11 @@ export const langlangbotPlugin: ChannelPlugin<LanglangbotAccount> = {
     resolveOutboundSessionRoute: resolveLanglangbotOutboundSessionRoute,
   },
   agentPrompt: {
+    // Always reaches the model: rendered into the inbound trusted-metadata
+    // block as response_format. `messageToolHints` is not a substitute — those
+    // hints only enter the prompt when the `message` tool exists, and this
+    // direct channel only gets that tool under message-tool delivery modes.
+    inboundFormattingHints: () => OPERATOR_FORMATTING_HINTS,
     messageToolHints: () => [
       "LangLangBot delivery target is conversation:<uuid> from the active session key.",
       "Operator chat sets OwnerAllowFrom from ODA-attested owner_surface_id; cron tool is usually available without commands.ownerAllowFrom.",

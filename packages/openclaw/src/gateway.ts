@@ -57,6 +57,17 @@ import {
 } from "./turn-control.js";
 import { buildLanglangbotSessionKey } from "./session-key.js";
 import {
+  appendStreamedBlock,
+  blockSeparator,
+  isMarkdownSafeTail,
+} from "./stream-text.js";
+
+/**
+ * Stop holding a half-written delta once it grows past this: a long fenced
+ * block or table should still stream instead of appearing all at once.
+ */
+const DELTA_HOLD_MAX_CHARS = 600;
+import {
   AUTO_HISTORY_MAX_AGE_MS,
   AUTO_HISTORY_MESSAGE_LIMIT,
   planSessionHistoryRestore,
@@ -887,6 +898,10 @@ async function handleInbound(
     });
     const streamState = {
       streamedText: "",
+      // Text already accepted from OpenClaw but not yet shown to the client:
+      // holding it back keeps a table, list or fenced block from rendering
+      // half-written while the rest of it is still on the way.
+      pendingDelta: "",
       sentFinal: false,
       pendingMedia: [] as string[],
       sentMedia: new Set<string>(),
@@ -1016,6 +1031,17 @@ async function handleInbound(
               lane(() =>
                 finalizeIdleTurn({
                   sendFinal: async () => {
+                    if (streamState.pendingDelta) {
+                      const chunk = streamState.pendingDelta;
+                      streamState.pendingDelta = "";
+                      ctx.log?.debug?.(
+                        `[langlangbot:${account.accountId}] outbound delta (final, ${chunk.length} chars) → ${inbound.conversationId}`,
+                      );
+                      markOutboundFirst(null);
+                      await sidecar
+                        .sendDelta(inbound.conversationId, chunk)
+                        .catch(() => undefined);
+                    }
                     if (
                       account.streaming &&
                       streamState.streamedText &&
@@ -1150,12 +1176,41 @@ async function handleInbound(
                     return;
                   }
                   if (account.streaming && kind === "block") {
-                    streamState.streamedText = text;
+                    // A reply can arrive as several blocks; keep them all.
+                    // Overwriting here dropped every earlier block from the
+                    // message onIdle finally delivers.
+                    const separator = blockSeparator(
+                      streamState.streamedText,
+                      text,
+                    );
+                    ctx.log?.info?.(
+                      `[langlangbot:${account.accountId}] stream block ${text.length} chars sep=${JSON.stringify(separator)} prevTail=${JSON.stringify(streamState.streamedText.slice(-14))} → ${inbound.conversationId}`,
+                    );
+                    streamState.streamedText = appendStreamedBlock(
+                      streamState.streamedText,
+                      text,
+                    );
+                    streamState.pendingDelta = appendStreamedBlock(
+                      streamState.pendingDelta,
+                      text,
+                    );
+                    const ready =
+                      isMarkdownSafeTail(streamState.pendingDelta) ||
+                      streamState.pendingDelta.length >= DELTA_HOLD_MAX_CHARS;
+                    if (!ready) {
+                      ctx.log?.debug?.(
+                        `[langlangbot:${account.accountId}] outbound delta held (${streamState.pendingDelta.length} chars) → ${inbound.conversationId}`,
+                      );
+                      markOutboundFirst(null);
+                      return;
+                    }
+                    const chunk = streamState.pendingDelta;
+                    streamState.pendingDelta = "";
                     ctx.log?.debug?.(
-                      `[langlangbot:${account.accountId}] outbound delta (${text.length} chars) → ${inbound.conversationId}`,
+                      `[langlangbot:${account.accountId}] outbound delta (${chunk.length} chars) → ${inbound.conversationId}`,
                     );
                     markOutboundFirst(null);
-                    await sidecar.sendDelta(inbound.conversationId, text);
+                    await sidecar.sendDelta(inbound.conversationId, chunk);
                     return;
                   }
                   // OpenClaw often emits only a final payload (no block chunks). The Operator
