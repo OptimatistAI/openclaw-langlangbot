@@ -1,3 +1,8 @@
+---
+name: langlangbot-channel
+description: Connect OpenClaw to LangLangBot so the LangLang Operator app can chat with your Agent and approve exec/plugin actions.
+---
+
 # LangLangBot channel
 
 Connect OpenClaw to **LangLangBot** so the **LangLang Operator app** (mobile client) can chat with your Agent and approve sensitive exec/plugin actions.
@@ -22,7 +27,7 @@ Copy the command as displayed (8-character short code, shown `XXXX-XXXX`). Tap
 approve on the phone after checking hostname / IP / OS / TLS fingerprint; do not
 type a confirmation code. Scripts may still use `langlangbot pair --id <base64>`.
 
-3. Configure OpenClaw — **LangLangBot starts automatically** when the gateway enables this channel (`autoStartSidecar: true` by default):
+3. Configure OpenClaw — `install.sh` registers a user-level sidecar service (systemd --user / launchd) and sets `autoStartSidecar: false`; the plugin only connects and never restarts the process. Set `autoStartSidecar: true` only when deliberately running without the service (`install.sh --no-service`):
 
 ```json5
 {
@@ -30,10 +35,10 @@ type a confirmation code. Scripts may still use `langlangbot pair --id <base64>`
     langlangbot: {
       enabled: true,
       sidecarUrl: "https://127.0.0.1:9528",
-      autoStartSidecar: true,
+      autoStartSidecar: false,
       pluginToken: "<optional shared secret>",
-      sidecarBinary: "/path/to/langlangbot",
-      sidecarEnvPath: "~/.langlangbot/env",
+      sidecarBinary: "/path/to/langlangbot", // fallback only
+      sidecarEnvPath: "~/.langlangbot/env",  // sourced by the service wrapper
       streaming: true,
     },
   },
