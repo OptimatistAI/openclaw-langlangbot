@@ -31,7 +31,7 @@
     }
   },
   "scripts": {
-    "build": "npm run build --prefix ../connector && esbuild index.ts setup-entry.ts --bundle --platform=node --format=esm --outdir=dist --external:openclaw --external:openclaw/*",
+    "build": "npm run build --prefix ../connector && esbuild index.ts setup-entry.ts --bundle --platform=node --format=esm --outdir=dist --external:openclaw --external:openclaw/* --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\"",
     "prepack": "npm run build"
   },
   "openclaw": {
