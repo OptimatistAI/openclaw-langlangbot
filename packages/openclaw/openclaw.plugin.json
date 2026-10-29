@@ -26,7 +26,8 @@
       },
       "autoStartSidecar": {
         "type": "boolean",
-        "default": true
+        "default": true,
+        "description": "Spawn or take over the sidecar. Set false when systemd/launchd owns it."
       },
       "sidecarBinary": {
         "type": "string"
@@ -62,7 +63,11 @@
             "default": "https://127.0.0.1:9528"
           },
           "pluginToken": { "type": "string" },
-          "autoStartSidecar": { "type": "boolean", "default": true },
+          "autoStartSidecar": {
+            "type": "boolean",
+            "default": true,
+            "description": "Spawn or take over the sidecar. Set false when systemd/launchd owns it."
+          },
           "sidecarBinary": { "type": "string" },
           "sidecarEnvPath": { "type": "string" },
           "sidecarStartTimeoutMs": { "type": "number", "default": 30000 },

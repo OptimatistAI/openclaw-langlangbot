@@ -1,5 +1,7 @@
 import type { OpenClawConfig } from "openclaw/plugin-sdk/channel-core";
-import { resolveDefaultAgentId } from "openclaw/plugin-sdk/config-runtime";
+// agent-runtime is the only path exporting this helper in 2026.5.7 through
+// 2026.10.8; config-runtime was removed in 2026.10.
+import { resolveDefaultAgentId } from "openclaw/plugin-sdk/agent-runtime";
 
 type LanglangbotChannelConfig = {
   agentId?: string;

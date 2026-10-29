@@ -297,7 +297,8 @@ export async function ensureLanglangbotSidecar(
     const managed = managedByUrl.get(account.sidecarUrl);
     if (managed) {
       managed.refCount += 1;
-    } else {
+    } else if (account.autoStartSidecar) {
+      // An external supervisor owns restarts when autoStartSidecar=false.
       retainExternalWatch(account, log);
     }
     return { startedByPlugin: false };
